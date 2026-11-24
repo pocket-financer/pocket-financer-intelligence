@@ -17,6 +17,7 @@ from typing import Any
 from ..analyzer import DeterministicSmsAnalyzer
 from ..currency import CurrencyContext
 from ..labels import EventState, OperationalClass, WeakConfidence, WeakFacets
+from ..prefilter import prefilter
 from ..provenance import (
     PrivateArtifactError,
     atomic_write_json,
@@ -28,8 +29,7 @@ from ..provenance import (
     object_sha256,
     require_private_output,
 )
-from ..triage import evaluate_triage
-from ..types import CandidateKind, Disposition
+from ..types import CandidateKind, Disposition, SelectorAction, TriageDecision
 from .grouping import Grouping, build_grouping, template_hash
 from .pools import PoolInput, assign_pools, leakage_audit
 from .reports import aggregate_reports
@@ -98,7 +98,7 @@ def build_private_corpus(repo_root: Path, config_path: Path) -> dict[str, Any]:
             is_outgoing=is_outgoing if isinstance(is_outgoing, bool) else None,
             input_valid=input_valid,
         )
-        triage = evaluate_triage(analysis)
+        triage = _weak_triage(body_value, analysis)
         grouping = build_grouping(source_key, body_value, sender_value, timestamp_value)
         weak = _weak_facets(analysis, triage)
         item = {
@@ -527,6 +527,42 @@ def _resolve_within(root: Path, path: Path) -> Path:
     return resolved
 
 
+def _weak_triage(body: str, analysis: Any) -> TriageDecision:
+    reasons = set(analysis.reason_codes)
+    if not analysis.metadata.get("input_valid", False):
+        return TriageDecision(
+            Disposition.DISCARD,
+            SelectorAction.SKIP,
+            tuple(sorted(reasons | {"discard_invalid_input"})),
+        )
+    if analysis.metadata.get("is_outgoing") is True:
+        return TriageDecision(
+            Disposition.DISCARD,
+            SelectorAction.SKIP,
+            tuple(sorted(reasons | {"discard_reliable_outgoing"})),
+        )
+    pf = prefilter(body)
+    if pf.decision == "exclude":
+        return TriageDecision(
+            Disposition.DISCARD,
+            SelectorAction.SKIP,
+            tuple(sorted(reasons | {f"prefilter_{pf.reason}"})),
+        )
+    has_direction = bool(analysis.candidates_of(CandidateKind.DIRECTION))
+    has_amount = bool(analysis.candidates_of(CandidateKind.AMOUNT))
+    if has_direction and has_amount:
+        return TriageDecision(
+            Disposition.INVOKE,
+            SelectorAction.RUN_NORMAL,
+            tuple(sorted(reasons)),
+        )
+    return TriageDecision(
+        Disposition.RETAIN_REVIEW,
+        SelectorAction.RUN_ASSISTIVE if (has_amount or has_direction) else SelectorAction.SKIP,
+        tuple(sorted(reasons)),
+    )
+
+
 def _implementation_hash(repo_root: Path) -> str:
     package_root = Path(__file__).parents[1]
     paths = [
@@ -537,11 +573,10 @@ def _implementation_hash(repo_root: Path) -> str:
         ("code/analyzer.py", package_root / "analyzer.py"),
         ("code/currency.py", package_root / "currency.py"),
         ("code/labels.py", package_root / "labels.py"),
+        ("code/prefilter.py", package_root / "prefilter.py"),
         ("code/profiles.py", package_root / "profiles.py"),
         ("code/provenance.py", package_root / "provenance.py"),
-        ("code/selector.py", package_root / "selector.py"),
         ("code/structural_text.py", package_root / "structural_text.py"),
-        ("code/triage.py", package_root / "triage.py"),
         ("code/types.py", package_root / "types.py"),
     ]
     config_root = repo_root / "configs" / "sms_processing"

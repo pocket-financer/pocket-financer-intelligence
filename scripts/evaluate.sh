@@ -7,11 +7,10 @@
 # vs full reasoning. Bonsai is excluded per user.
 #
 # Usage:
-#   bash scripts/evaluate.sh                  # smoke (10), prompt y/n, full (203), report
-#   bash scripts/evaluate.sh --auto-full      # smoke → full → report, no prompt
-#   bash scripts/evaluate.sh --smoke-only     # smoke only, no full, no report
-#   bash scripts/evaluate.sh --full-only      # full only, no smoke; report at end
-#   bash scripts/evaluate.sh --report-only    # only regenerate RESULTS/report.html
+#   bash scripts/evaluate.sh                  # smoke (10), prompt y/n, full (203)
+#   bash scripts/evaluate.sh --auto-full      # smoke → full, no prompt
+#   bash scripts/evaluate.sh --smoke-only     # smoke only, no full
+#   bash scripts/evaluate.sh --full-only      # full only, no smoke
 #
 # Per-model thinking is auto-detected from each tokenizer's chat template
 # (Qwen3 family → on; everything else → off). Override with THINKING env var.
@@ -24,7 +23,7 @@ cd "$(dirname "$0")/.."
 
 source scripts/activate_wsl.sh
 
-GRAMMAR="${GRAMMAR:-DATA/sms_extraction.gbnf}"
+GRAMMAR="${GRAMMAR:-configs/sms_processing/grammars/sms-extractor.gbnf}"
 THINKING="${THINKING:-auto}"
 
 MODE="full+smoke"
@@ -32,19 +31,10 @@ case "${1:-}" in
   --smoke-only) MODE="smoke" ;;
   --full-only)  MODE="full" ;;
   --auto-full)  MODE="auto" ;;
-  --report-only) MODE="report" ;;
-  --help|-h) sed -n '1,21p' "$0"; exit 0 ;;
+  --help|-h) sed -n '1,20p' "$0"; exit 0 ;;
   "") ;;
   *) echo "Unknown flag: $1"; exit 2 ;;
 esac
-
-build_report() {
-  echo ""
-  echo "================================================================"
-  echo "[evaluate] Generating HTML report"
-  echo "================================================================"
-  python scripts/build_report.py
-}
 
 # ── Slate: each line is `<HF repo id>  <gguf-basename-prefix>` ─────────────────
 # Smoke runs use only Q4_K_M per model (one-per-model sanity check —
@@ -166,15 +156,10 @@ case "$MODE" in
     ;;
   full)
     run_pass full
-    build_report
     ;;
   auto)
     run_pass smoke
     run_pass full
-    build_report
-    ;;
-  report)
-    build_report
     ;;
   full+smoke)
     run_pass smoke
@@ -182,7 +167,6 @@ case "$MODE" in
     read -p "[evaluate] Smoke runs done. Run full 203-sample pass? [y/N] " ans
     if [[ "$ans" =~ ^[Yy]$ ]]; then
       run_pass full
-      build_report
     else
       echo "[evaluate] Skipping full pass."
     fi

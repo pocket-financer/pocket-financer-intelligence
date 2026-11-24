@@ -9,7 +9,7 @@ from enum import StrEnum
 
 from .currency import parse_money
 from .extractor import SourceSpan, parse_and_normalize_extraction
-from .types import Analysis, Candidate, CandidateKind, CurrencyProvenance, Direction, EvidenceSpan
+from .types import CurrencyProvenance, Direction, EvidenceSpan
 
 
 class OperationalClass(StrEnum):
@@ -208,64 +208,6 @@ def validate_canonical_label(label: CanonicalLabel, source: str) -> None:
             raise LabelValidationError("label_event_facets_inconsistent")
 
 
-def project_selector_target(
-    label: CanonicalLabel, analysis: Analysis, source: str
-) -> dict[str, str]:
-    """Project valid rich truth into the compact selector contract or fail explicitly."""
-
-    validate_canonical_label(label, source)
-    if label.status not in {ReviewStatus.SUBMITTED, ReviewStatus.ADJUDICATED}:
-        raise LabelValidationError("projection_label_not_committed")
-    if label.operational_class == OperationalClass.INVALID_OUTGOING:
-        raise LabelValidationError("projection_invalid_outgoing_excluded")
-    if label.decision in {CanonicalDecision.NOT_POSTED, CanonicalDecision.NON_FINANCIAL}:
-        return {"decision": "none"}
-    if label.decision in {CanonicalDecision.AMBIGUOUS, CanonicalDecision.MULTIPLE_EVENT}:
-        return {"decision": "abstain"}
-
-    event = label.events[0]
-    if event.account_state == PresenceState.UNKNOWN:
-        raise LabelValidationError("projection_account_unknown")
-    if event.counterparty_state == PresenceState.UNKNOWN:
-        raise LabelValidationError("projection_counterparty_unknown")
-    amount = _match_span(
-        analysis, CandidateKind.AMOUNT, event.amount_span, "projection_missing_amount_candidate"
-    )
-    direction = _match_span(
-        analysis,
-        CandidateKind.DIRECTION,
-        event.direction_span,
-        "projection_missing_direction_candidate",
-    )
-    if amount.value.get("currency") != event.currency:
-        raise LabelValidationError("projection_currency_mismatch")
-    if amount.value.get("currency_provenance") != event.currency_provenance.value:
-        raise LabelValidationError("projection_currency_provenance_mismatch")
-    if direction.value.get("direction") != event.direction.value:
-        raise LabelValidationError("projection_direction_mismatch")
-    account = _presence_candidate(
-        analysis,
-        CandidateKind.ACCOUNT,
-        event.account_state,
-        event.account_span,
-        "projection_missing_account_candidate",
-    )
-    counterparty = _presence_candidate(
-        analysis,
-        CandidateKind.COUNTERPARTY,
-        event.counterparty_state,
-        event.counterparty_span,
-        "projection_missing_counterparty_candidate",
-    )
-    return {
-        "decision": "posted",
-        "amount": amount.candidate_id,
-        "direction": direction.candidate_id,
-        "account": account.candidate_id,
-        "counterparty": counterparty.candidate_id,
-    }
-
-
 def canonical_label_to_dict(label: CanonicalLabel) -> dict:
     """Return the JSON contract form without duplicating private evidence text."""
 
@@ -327,38 +269,6 @@ def _validate_facets(family: str | None, rail: str | None) -> None:
         raise LabelValidationError("label_financial_family_invalid")
     if rail is not None and rail not in PAYMENT_RAILS:
         raise LabelValidationError("label_payment_rail_invalid")
-
-
-def _match_span(
-    analysis: Analysis, kind: CandidateKind, span: EvidenceSpan, reason: str
-) -> Candidate:
-    matches = [
-        candidate
-        for candidate in analysis.candidates_of(kind)
-        if candidate.evidence is not None
-        and candidate.evidence.start_char == span.start_char
-        and candidate.evidence.end_char == span.end_char
-    ]
-    if len(matches) != 1:
-        raise LabelValidationError(reason)
-    return matches[0]
-
-
-def _presence_candidate(
-    analysis: Analysis,
-    kind: CandidateKind,
-    state: PresenceState,
-    span: EvidenceSpan | None,
-    reason: str,
-) -> Candidate:
-    if state == PresenceState.ABSENT:
-        matches = [candidate for candidate in analysis.candidates_of(kind) if candidate.explicit_absence]
-        if len(matches) != 1:
-            raise LabelValidationError(reason)
-        return matches[0]
-    if state == PresenceState.PRESENT and span is not None:
-        return _match_span(analysis, kind, span, reason)
-    raise LabelValidationError(reason)
 
 
 @dataclass(frozen=True, slots=True)
@@ -466,6 +376,8 @@ def project_extractor_target(label: CanonicalLabelV2, source: str) -> dict:
         raise LabelValidationError("projection_label_not_committed")
     if label.operational_class == OperationalClass.INVALID_OUTGOING:
         raise LabelValidationError("projection_invalid_outgoing_excluded")
+    if label.uncertain:
+        raise LabelValidationError("projection_uncertain")
     if label.decision in {"none", "abstain"}:
         return {"decision": label.decision}
     assert label.event is not None

@@ -25,6 +25,7 @@ TRACE_V2_CONTRACT = "pocketfinancer.processing-trace/2"
 TRACE_V2_STAGES = frozenset(
     {
         "admission",
+        "prefilter",
         "configuration",
         "claim",
         "analysis",
@@ -206,6 +207,7 @@ TRACE_V3_CONTRACT = "pocketfinancer.processing-trace/3"
 TRACE_V3_STAGES = frozenset(
     {
         "admission",
+        "prefilter",
         "configuration",
         "claim",
         "analysis_advisory",

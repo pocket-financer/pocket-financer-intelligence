@@ -7,10 +7,14 @@ from dataclasses import replace
 
 import pytest
 
-from pocketfinancer_sms.configuration import AssetBinding, ProcessingTrigger, RolloutMode
-from pocketfinancer_sms.configuration_v3 import (
+from pocketfinancer_sms.configuration import (
+    PIPELINE_CONTRACT,
+    AssetBinding,
     ExtractorRuntimeConfig,
-    ProcessingConfigSnapshotV3,
+    ProcessingConfigSnapshot,
+    ProcessingTrigger,
+    RolloutMode,
+    WireTransport,
 )
 from pocketfinancer_sms.extractor import SourceSpan
 from pocketfinancer_sms.feedback import (
@@ -27,7 +31,7 @@ from pocketfinancer_sms.labels import (
     ReviewStatus,
     project_extractor_target,
 )
-from pocketfinancer_sms.processing_v3 import ReviewCase, ReviewUserRevision
+from pocketfinancer_sms.processing import ReviewCase, ReviewUserRevision
 from pocketfinancer_sms.trace import ProcessingTraceV3, TraceEventV3
 from pocketfinancer_sms.types import Direction, TimestampProvenance
 
@@ -53,15 +57,15 @@ def _source_and_event() -> tuple[str, ExtractorCanonicalEvent]:
     )
 
 
-def _config() -> ProcessingConfigSnapshotV3:
-    return ProcessingConfigSnapshotV3(
+def _config() -> ProcessingConfigSnapshot:
+    return ProcessingConfigSnapshot(
         operation_id="11111111-1111-4111-8111-111111111111",
         parent_operation_id=None,
         source_ref_hash="1" * 64,
         trigger=ProcessingTrigger.REALTIME,
         created_at_epoch_ms=1_700_000_000_100,
         admission_epoch_ms=1_700_000_000_000,
-        release_id="native-integration-v3",
+        release_id=PIPELINE_CONTRACT,
         release_manifest_sha256="2" * 64,
         analyzer_behavior_version="pocketfinancer.structural-sms-analyzer/2",
         unicode_behavior_version="unicode-scalar-nfkc-casefold",
@@ -80,15 +84,17 @@ def _config() -> ProcessingConfigSnapshotV3:
             ineligibility_reason=None,
             model_identifier="synthetic-local-model",
             model_file_sha256="9" * 64,
+            model_identity_kind="file_sha256",
             runtime_version="synthetic-runtime",
             os_version="synthetic-os",
             device_cohort="synthetic-device",
             prompt_sha256="6" * 64,
             grammar_sha256="7" * 64,
+            grammar_enabled=True,
+            wire_transport=WireTransport.DIRECT_JSON,
             validation_profile_sha256="8" * 64,
         ),
-        persistence_policy_version="pocketfinancer.persistence-policy/2",
-        rollout_mode=RolloutMode.SHADOW,
+        rollout_mode=RolloutMode.AUTOMATIC,
     )
 
 
@@ -110,10 +116,10 @@ def _feedback_review(source: str) -> ReviewCase:
     )
 
 
-def test_processing_config_v3_is_immutable_hashed_and_timestamp_read_only() -> None:
+def test_processing_config_is_immutable_hashed_and_timestamp_read_only() -> None:
     config = _config()
     payload = config.to_dict()
-    assert payload["contract"] == "pocketfinancer.processing-config/3"
+    assert payload["contract"] == PIPELINE_CONTRACT
     assert payload["extractor"]["parser_deadline_ms"] == 0
     assert payload["received_timestamp"] == {
         "epoch_ms": 1_699_999_999_000,

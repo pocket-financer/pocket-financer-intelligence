@@ -13,7 +13,7 @@ from .extractor import SourceSpan
 from .types import EvidenceSpan
 
 if TYPE_CHECKING:
-    from .processing_v3 import ReviewCase
+    from .processing import ReviewCase
 
 
 FEEDBACK_V2_CONTRACT = "pocketfinancer.user-feedback/2"
@@ -340,7 +340,7 @@ class UserFeedbackEventV3:
         canonical_label_id: str | None = None,
         canonical_label_revision: int | None = None,
     ) -> "UserFeedbackEventV3":
-        from .processing_v3 import ReviewCase
+        from .processing import ReviewCase
 
         _require_uuid(action_id, "action")
         _require_uuid(operation_id, "operation")

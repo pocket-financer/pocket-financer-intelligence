@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
-from .apple_evaluation import evaluate_apple_foundation_models
 from .corpus import build_private_corpus
-from .evaluation import EvaluationInterrupted, evaluate_extractor
+from .evaluation import (
+    EvaluationInterrupted,
+    evaluate_apple_foundation_models,
+    evaluate_extractor,
+)
+from .prefilter import prefilter
 from .provenance import PrivateArtifactError, file_sha256, require_private_output
 from .workbench.native_import import AesGcmBundleDecryptor, NativeTraceImporter
 from .workbench.secure_store import (
@@ -27,12 +32,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="PocketFinancer local SMS processing tools")
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     subparsers = parser.add_subparsers(dest="command", required=True)
+
     corpus = subparsers.add_parser("build-corpus", help="build the ignored canonical corpus")
     corpus.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/sms_processing/archive-india-inr.json"),
+        default=Path("configs/sms_processing/profiles/archive-india-inr.json"),
     )
+
+    pf = subparsers.add_parser("prefilter", help="run deterministic prefilter on stdin text")
+    pf.add_argument("--text", type=str, help="message body (reads stdin if omitted)")
+
     subparsers.add_parser("init-workbench", help="import the current canonical manifest")
     serve = subparsers.add_parser("serve-workbench", help="serve the loopback-only workbench")
     serve.add_argument("--port", type=int, default=8765)
@@ -55,12 +65,14 @@ def build_parser() -> argparse.ArgumentParser:
         "migrate-secure-workbench",
         help="create and verify an encrypted replacement for the legacy workbench",
     )
+
     native_import = subparsers.add_parser(
         "import-native-trace",
         help="explicitly import one encrypted Android or iOS trace bundle",
     )
     native_import.add_argument("--bundle", type=Path, required=True)
     native_import.add_argument("--key-id", default="native-trace-import-v1")
+
     evaluation = subparsers.add_parser(
         "evaluate-extractor",
         help="evaluate the direct extractor with a local GGUF",
@@ -79,22 +91,54 @@ def build_parser() -> argparse.ArgumentParser:
     evaluation.add_argument("--n-gpu-layers", type=int, default=-1)
     evaluation.add_argument("--seed", type=int, default=0)
     evaluation.add_argument("--max-tokens", type=int, default=512)
+    evaluation.add_argument("--no-grammar", action="store_true")
+    evaluation.add_argument("--no-prefilter", action="store_true")
+
     apple = subparsers.add_parser(
         "evaluate-apple-fm",
-        help="evaluate synthetic SMS locally with Apple's macOS Foundation Models SDK",
+        help="evaluate locally with Apple's macOS Foundation Models SDK",
     )
-    apple.add_argument("--suite", choices=("synthetic",), default="synthetic")
+    apple.add_argument(
+        "--suite",
+        choices=("synthetic", "grandfathered", "private-canonical"),
+        default="synthetic",
+    )
     apple.add_argument("--output-dir", type=Path, required=True)
+    apple.add_argument("--account-catalog", type=Path)
     apple.add_argument("--locale", default="en_US")
     apple.add_argument("--primary-currency", default="INR")
     apple.add_argument("--profile", action="append", dest="profiles")
     apple.add_argument("--max-tokens", type=int, default=512)
+    apple.add_argument("--no-prefilter", action="store_true")
+
+    sync = subparsers.add_parser(
+        "sync-native-assets",
+        help="build release manifest and sync/verify assets into Android and iOS",
+    )
+    sync.add_argument("--check", action="store_true")
+    sync.add_argument("--manifest-only", action="store_true")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "prefilter":
+            body = args.text if args.text is not None else sys.stdin.read()
+            res = prefilter(body)
+            print(json.dumps({"decision": res.decision, "reason": res.reason}, sort_keys=True))
+            return 0
+        if args.command == "sync-native-assets":
+            scripts_dir = str((args.repo_root.resolve() / "scripts"))
+            if scripts_dir not in sys.path:
+                sys.path.insert(0, scripts_dir)
+            import sync_native_assets  # type: ignore[import-not-found]
+
+            return sync_native_assets.sync(
+                args.repo_root.resolve(),
+                check=args.check,
+                manifest_only=args.manifest_only,
+            )
         if args.command == "build-corpus":
             summary = build_private_corpus(args.repo_root, args.config)
             print(json.dumps(summary, sort_keys=True))
@@ -113,6 +157,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     n_gpu_layers=args.n_gpu_layers,
                     seed=args.seed,
                     max_tokens=args.max_tokens,
+                    grammar_enabled=not args.no_grammar,
+                    apply_prefilter=not args.no_prefilter,
                 )
             except EvaluationInterrupted as exc:
                 print(
@@ -134,10 +180,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.repo_root,
                     suite=args.suite,
                     output_dir=args.output_dir,
+                    account_catalog=args.account_catalog,
                     locale=args.locale,
                     primary_currency=args.primary_currency,
                     enabled_profile_ids=tuple(args.profiles or ("core-en", "india")),
                     max_tokens=args.max_tokens,
+                    apply_prefilter=not args.no_prefilter,
                 )
             except EvaluationInterrupted as exc:
                 print(
@@ -299,14 +347,7 @@ def _private_root(repo_root: Path) -> Path:
 
 
 def _release_manifest_sha256(repo_root: Path) -> str:
-    manifest = (
-        repo_root.resolve()
-        / "configs"
-        / "sms_processing"
-        / "contracts"
-        / "releases"
-        / "native-integration-v2.json"
-    )
+    manifest = repo_root.resolve() / "configs" / "sms_processing" / "release-manifest.json"
     try:
         return file_sha256(manifest)
     except OSError as exc:

@@ -1,4 +1,4 @@
-"""Production-intended, local-first SMS processing foundation."""
+"""Local-first SMS processing foundation."""
 
 from .analyzer import DeterministicSmsAnalyzer
 from .currency import CurrencyContext
@@ -8,31 +8,27 @@ from .extractor import (
     build_extractor_input,
     collect_grounded_extractor_fields,
     parse_and_normalize_extraction,
+    project_apple_fm_flat_output,
 )
-from .persistence import evaluate_persistence, processing_result_payload
-from .processing_v3 import (
+from .prefilter import PrefilterResult, prefilter
+from .processing import (
     ExtractionCoordinator,
-    SuccessorExtractionCoordinator,
-    evaluate_persistence_v3,
-    processing_result_payload_v3,
+    evaluate_persistence,
+    processing_result_payload,
 )
-from .selector import parse_and_reconstruct
-from .triage import evaluate_triage
 
 __all__ = [
     "CurrencyContext",
     "DeterministicSmsAnalyzer",
     "ExtractionCoordinator",
     "ExtractorFieldEvidence",
+    "PrefilterResult",
     "SourceSpan",
-    "SuccessorExtractionCoordinator",
     "build_extractor_input",
     "collect_grounded_extractor_fields",
     "evaluate_persistence",
-    "evaluate_persistence_v3",
-    "evaluate_triage",
     "parse_and_normalize_extraction",
-    "parse_and_reconstruct",
+    "prefilter",
     "processing_result_payload",
-    "processing_result_payload_v3",
+    "project_apple_fm_flat_output",
 ]

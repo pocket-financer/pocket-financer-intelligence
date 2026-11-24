@@ -25,12 +25,11 @@ from ..labels import (
     canonical_label_to_dict,
     canonical_label_v2_to_dict,
     project_extractor_target,
-    project_selector_target,
     validate_canonical_label,
     validate_canonical_label_v2,
 )
 from ..provenance import object_sha256
-from ..types import Analysis, CurrencyProvenance, Direction, EvidenceSpan
+from ..types import CurrencyProvenance, Direction, EvidenceSpan
 from .native_import import NativeTraceImporter
 from .source_sets import SourceSetCatalog
 from .store import WorkbenchStore
@@ -396,16 +395,10 @@ class WorkbenchService:
                 "target": target,
                 "target_contract": "pocketfinancer.sms-extractor/1",
             }
-        label = _label_from_dict(canonical, source)
-        try:
-            analysis = Analysis.from_dict(record["analysis"], source=source)
-        except ValueError as exc:
-            raise WorkbenchValidationError("stored analysis cannot be validated") from exc
-        try:
-            target = project_selector_target(label, analysis, source)
-        except LabelValidationError as exc:
-            return {"convertible": False, "reason_code": exc.reason_code}
-        return {"convertible": True, "target": target, "target_contract": "historical-candidate-selector"}
+        return {
+            "convertible": False,
+            "reason_code": "historical_selector_contract_retired",
+        }
 
     def disagreements(self, source_id: str, reviewer_id: str) -> dict[str, Any]:
         record = self._require_record_and_reviewer(source_id, reviewer_id)
@@ -691,35 +684,6 @@ def _span(value: dict[str, Any], source: str) -> EvidenceSpan:
         return EvidenceSpan.from_source(source, start, end)
     except (KeyError, TypeError, ValueError) as exc:
         raise WorkbenchValidationError("evidence span is outside the source message") from exc
-
-
-def _label_from_dict(value: dict[str, Any], source: str) -> CanonicalLabel:
-    payload = {
-        "decision": value["decision"],
-        "operational_class": value["operational_class"],
-        "event_state": value["event_state"],
-        "financial_family": value.get("financial_family"),
-        "payment_rail": value.get("payment_rail"),
-        "events": value.get("events", []),
-        "uncertain": value["uncertain"],
-        "notes": value.get("notes", ""),
-    }
-    label = _build_label(
-        source_id=value["source_id"],
-        reviewer_id=value["reviewer_id"],
-        revision=int(value["revision"]),
-        status=ReviewStatus(value["status"]),
-        payload=payload,
-        source=source,
-    )
-    return CanonicalLabel(
-        **{
-            **{field: getattr(label, field) for field in label.__dataclass_fields__},
-            "label_id": value["label_id"],
-            "created_at_epoch_ms": int(value["created_at_epoch_ms"]),
-            "supersedes_revision": value.get("supersedes_revision"),
-        }
-    )
 
 
 def _validate_weak_correction(facets: dict[str, Any]) -> None:

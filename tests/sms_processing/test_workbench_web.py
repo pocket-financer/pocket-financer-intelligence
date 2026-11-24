@@ -15,7 +15,6 @@ from pocketfinancer_sms.analyzer import DeterministicSmsAnalyzer
 from pocketfinancer_sms.corpus.grouping import build_grouping
 from pocketfinancer_sms.currency import CurrencyContext
 from pocketfinancer_sms.extractor import SourceSpan
-from pocketfinancer_sms.triage import evaluate_triage
 from pocketfinancer_sms.workbench.service import WorkbenchService
 from pocketfinancer_sms.workbench.store import WorkbenchStore
 from pocketfinancer_sms.workbench.web import WorkbenchWebServer
@@ -27,7 +26,6 @@ def _server(tmp_path: Path) -> tuple[WorkbenchWebServer, str]:
     analysis = DeterministicSmsAnalyzer(
         CurrencyContext("INR", ("core-en", "india"))
     ).analyze(body, operation_id=source_id, is_outgoing=False)
-    triage = evaluate_triage(analysis)
     grouping = build_grouping(b"web-synthetic-key" * 2, body, "SYNTH-BANK", "2024-02-01T00:00:00Z")
     record = {
         "contract": "pocketfinancer.corpus-record/1",
@@ -42,14 +40,14 @@ def _server(tmp_path: Path) -> tuple[WorkbenchWebServer, str]:
         },
         "analysis": analysis.to_dict(),
         "weak_facets": {
-            "disposition": triage.disposition.value,
-            "selector_action": triage.selector_action.value,
+            "disposition": "invoke",
+            "selector_action": "run_normal",
             "operational_class": "posted_candidate",
             "event_state": "posted",
             "financial_family": "card_purchase",
             "payment_rail": "card",
             "confidence": "medium",
-            "reason_codes": list(triage.reason_codes),
+            "reason_codes": ["amount_and_direction_present"],
         },
         "grouping": asdict(grouping),
         "pool": "protected_test",

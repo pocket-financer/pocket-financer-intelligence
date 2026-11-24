@@ -1,32 +1,59 @@
-"""Private-safe, resumable local GGUF evaluation for the direct SMS extractor."""
+"""Unified private-safe, resumable end-to-end SMS pipeline evaluation.
+
+Supports three local runtime lanes over the same deterministic host boundary:
+1. GGUF / llama-cpp-python (Android target runtime)
+2. Apple Foundation Models SDK on macOS (iOS target runtime)
+3. Isolated stateful SQLite supplied-response mechanics runner
+"""
 
 from __future__ import annotations
 
-import importlib
+import asyncio
 import fcntl
+import hashlib
+import importlib
+import importlib.metadata
 import json
 import math
 import os
+import platform
 import re
+import sqlite3
 import statistics
+import sys
 import time
+import uuid
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from decimal import Decimal
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Protocol
 
-from .account_resolution import AccountCatalogEntry, resolve_account
+from .account_resolution import (
+    DUPLICATE_WINDOW_MS,
+    AccountCatalogEntry,
+    RecentTransactionRecord,
+    is_within_duplicate_window,
+    normalize_account_alias,
+    resolve_account,
+    transaction_fingerprint,
+)
 from .analyzer import ANALYSIS_CONTRACT_V2, DeterministicSmsAnalyzer
 from .corpus.grouping import sender_family
-from .currency import CurrencyContext, ISO_MINOR_UNITS, MAX_SIGNED_64
+from .currency import ISO_MINOR_UNITS, MAX_SIGNED_64, CurrencyContext
 from .extractor import (
+    APPLE_FLAT_FIELDS,
     ExtractionValidationError,
     build_extractor_input,
     normalize_account_reference,
     normalize_counterparty,
     parse_and_normalize_extraction,
+    project_apple_fm_flat_output,
 )
+from .prefilter import POLICY_ID as PREFILTER_POLICY_ID
+from .prefilter import prefilter
+from .processing import ExtractionCoordinator, processing_result_payload
 from .provenance import (
     PrivateArtifactError,
     atomic_write_json,
@@ -35,19 +62,24 @@ from .provenance import (
     object_sha256,
     require_private_output,
 )
-from .types import Analysis, CandidateKind
+from .types import Analysis, CandidateKind, TimestampProvenance
 
 
 EVALUATION_CONTRACT = "pocketfinancer.sms-extractor-evaluation/2"
 SCORING_VERSION = "pocketfinancer.sms-model-quality-scoring/2"
-SUITE_MANIFEST_PATH = Path("configs/sms_processing/evaluations/model-quality-v1.json")
-PROMPT_PATH = Path("configs/sms_processing/prompts/sms-extractor-v1.txt")
-GRAMMAR_PATH = Path("configs/sms_processing/grammars/sms-extractor-v1.gbnf")
-SCHEMA_PATH = Path("configs/sms_processing/contracts/v3/sms-extractor.schema.json")
-PROFILE_PATH = Path("configs/sms_processing/contracts/v3/extractor-validation-profile.json")
+RUN_CONTRACT = "synthetic-stateful-pipeline/1"
+SUITE_MANIFEST_PATH = Path("configs/sms_processing/evaluations/model-quality.json")
+PROMPT_PATH = Path("configs/sms_processing/prompts/sms-extractor.txt")
+APPLE_PROMPT_PATH = Path("configs/sms_processing/prompts/apple-fm-sms-extractor.txt")
+GRAMMAR_PATH = Path("configs/sms_processing/grammars/sms-extractor.gbnf")
+SCHEMA_PATH = Path("configs/sms_processing/schemas/sms-extractor.schema.json")
+APPLE_SCHEMA_PATH = Path("configs/sms_processing/schemas/apple-fm-flat.schema.json")
+PROFILE_PATH = Path("configs/sms_processing/profiles/extractor-validation.json")
 SYNTHETIC_PATH = Path("tests/sms_processing/fixtures/extractor/synthetic-suite.jsonl")
 GRANDFATHERED_PATH = Path("DATA/extraction_ds.jsonl")
+
 _SAFE_REASON = re.compile(r"^[a-z][a-z0-9_]{2,79}$")
+_LOCALE = re.compile(r"^[a-z]{2,3}_[A-Z]{2}$")
 _SMALL_GROUP_MINIMUM = 5
 _ATOMIC_TEMP = re.compile(r"^\.(?:checkpoint|report)\.json\.[A-Za-z0-9_-]+$")
 
@@ -75,6 +107,61 @@ class EvaluationRow:
     analysis_mode: str
     groups: Mapping[str, str]
     fingerprint_binding: Mapping[str, Any]
+
+
+class AppleProvider(Protocol):
+    provider_id: str
+    runtime_version: str
+
+    async def infer(
+        self, *, instructions: str, prompt: str, schema: Mapping[str, Any], max_tokens: int
+    ) -> Mapping[str, Any]: ...
+
+
+class AppleFMProvider:
+    """Official macOS SDK adapter; no import or model access occurs outside macOS."""
+
+    provider_id = "apple-fm-sdk-system-language-model-general"
+
+    def __init__(self) -> None:
+        if sys.platform != "darwin":
+            raise ExtractorEvaluationError(
+                "live Apple Foundation Models inference requires compatible macOS; "
+                "non-macOS hosts can run only fake-provider tests"
+            )
+        try:
+            fm = importlib.import_module("apple_fm_sdk")
+            model = fm.SystemLanguageModel()
+            available, _reason = model.is_available()
+        except (ImportError, OSError) as exc:
+            raise ExtractorEvaluationError(
+                "apple-fm-sdk is unavailable; install the optional macOS dependency"
+            ) from exc
+        except Exception as exc:
+            raise ExtractorEvaluationError("Apple Foundation Models initialization failed") from exc
+        if not available:
+            raise ExtractorEvaluationError(
+                "Apple Foundation Models is unavailable on this Mac; check Apple Intelligence, "
+                "Xcode, and model download"
+            )
+        self.fm = fm
+        self.model = model
+        try:
+            self.runtime_version = importlib.metadata.version("apple-fm-sdk")
+        except importlib.metadata.PackageNotFoundError:
+            self.runtime_version = "unknown"
+
+    async def infer(
+        self, *, instructions: str, prompt: str, schema: Mapping[str, Any], max_tokens: int
+    ) -> Mapping[str, Any]:
+        session = self.fm.LanguageModelSession(instructions=instructions, model=self.model)
+        options = self.fm.GenerationOptions(
+            sampling=self.fm.SamplingMode.greedy(), maximum_response_tokens=max_tokens
+        )
+        generated = await session.respond(prompt, json_schema=dict(schema), options=options)
+        if not generated.is_complete:
+            raise ValueError("incomplete guided output")
+        return json.loads(generated.to_json(), object_pairs_hook=_reject_duplicate_keys)
 
 
 def _locked_evaluation(func: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]:
@@ -116,6 +203,8 @@ def evaluate_extractor(
     n_gpu_layers: int = -1,
     seed: int = 0,
     max_tokens: int = 512,
+    grammar_enabled: bool = True,
+    apply_prefilter: bool = True,
     model_factory: Callable[..., Any] | None = None,
     grammar_factory: Callable[[Path], Any] | None = None,
     runtime_version: str | None = None,
@@ -147,7 +236,7 @@ def evaluate_extractor(
     catalog, catalog_hash = _load_account_catalog(root, account_catalog)
 
     llama_module = None
-    if model_factory is None or grammar_factory is None or runtime_version is None:
+    if model_factory is None or (grammar_enabled and grammar_factory is None) or runtime_version is None:
         try:
             llama_module = importlib.import_module("llama_cpp")
         except ImportError as exc:
@@ -173,7 +262,9 @@ def evaluate_extractor(
         "temperature": 0.0,
         "greedy_decoding": True,
         "chat_template": "gguf_embedded",
-        "grammar_constrained": True,
+        "grammar_constrained": grammar_enabled,
+        "apply_prefilter": apply_prefilter,
+        "prefilter_policy": PREFILTER_POLICY_ID if apply_prefilter else None,
         "per_row_deadline_ms": 0,
         "primary_currency": primary_currency,
         "enabled_profile_ids": list(enabled_profile_ids),
@@ -212,7 +303,7 @@ def evaluate_extractor(
         dataset_fingerprint=dataset_fingerprint,
     )
 
-    if grammar_factory is None:
+    if grammar_enabled and grammar_factory is None:
         grammar_class = getattr(llama_module, "LlamaGrammar")
 
         def load_grammar(path: Path) -> Any:
@@ -222,7 +313,7 @@ def evaluate_extractor(
     if model_factory is None:
         model_factory = getattr(llama_module, "Llama")
     try:
-        grammar = grammar_factory(grammar_path)
+        grammar = grammar_factory(grammar_path) if (grammar_enabled and grammar_factory) else None
         model = model_factory(
             model_path=str(model_path),
             n_ctx=n_ctx,
@@ -234,8 +325,316 @@ def evaluate_extractor(
         raise ExtractorEvaluationError("local GGUF runtime initialization failed") from exc
     _require_embedded_chat_template(model)
 
+    def invoke_gguf(row: EvaluationRow, extractor_input: Mapping[str, Any]) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            response = model.create_chat_completion(
+                messages=(
+                    {"role": "system", "content": prompt},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            extractor_input,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    },
+                ),
+                temperature=0.0,
+                max_tokens=max_tokens,
+                grammar=grammar,
+                seed=seed,
+            )
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            raw_output, finish_reason, usage = _chat_response(response)
+            if finish_reason == "length":
+                return _failed_record(
+                    row,
+                    latency_ms,
+                    "runtime_failure",
+                    "runtime_output_truncated",
+                    raw_output=raw_output,
+                    usage=usage,
+                )
+            return _parse_record(
+                row,
+                raw_output,
+                latency_ms,
+                primary_currency=primary_currency,
+                enabled_profile_ids=enabled_profile_ids,
+                catalog=catalog,
+                usage=usage,
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            return _failed_record(row, latency_ms, "runtime_failure", "runtime_failure")
+
+    try:
+        return _execute_rows(
+            rows=rows,
+            completed=completed,
+            checkpoint_path=checkpoint_path,
+            report_path=private_output / "report.json",
+            configuration_hash=configuration_hash,
+            dataset_fingerprint=dataset_fingerprint,
+            provenance=provenance,
+            capabilities=capabilities,
+            suite=suite,
+            primary_currency=primary_currency,
+            enabled_profile_ids=tuple(enabled_profile_ids),
+            apply_prefilter=apply_prefilter,
+            invoke_row=invoke_gguf,
+        )
+    finally:
+        model = None
+
+
+def evaluate_apple_foundation_models(
+    repo_root: Path,
+    *,
+    suite: str,
+    output_dir: Path,
+    account_catalog: Path | None = None,
+    locale: str = "en_US",
+    primary_currency: str = "INR",
+    enabled_profile_ids: tuple[str, ...] = ("core-en", "india"),
+    max_tokens: int = 512,
+    apply_prefilter: bool = True,
+    provider: AppleProvider | None = None,
+) -> dict[str, Any]:
+    """Run one private local suite with Apple Foundation Models guided generation."""
+
+    if provider is None and sys.platform != "darwin":
+        raise ExtractorEvaluationError(
+            "live Apple Foundation Models inference requires compatible macOS; "
+            "non-macOS hosts can run only fake-provider tests"
+        )
+    return _evaluate_apple_locked(
+        repo_root,
+        suite=suite,
+        output_dir=output_dir,
+        account_catalog=account_catalog,
+        locale=locale,
+        primary_currency=primary_currency,
+        enabled_profile_ids=enabled_profile_ids,
+        max_tokens=max_tokens,
+        apply_prefilter=apply_prefilter,
+        provider=provider,
+    )
+
+
+@_locked_evaluation
+def _evaluate_apple_locked(
+    repo_root: Path,
+    *,
+    suite: str,
+    output_dir: Path,
+    account_catalog: Path | None,
+    locale: str,
+    primary_currency: str,
+    enabled_profile_ids: tuple[str, ...],
+    max_tokens: int,
+    apply_prefilter: bool,
+    provider: AppleProvider | None,
+) -> dict[str, Any]:
+    if suite not in {"synthetic", "grandfathered", "private-canonical"}:
+        raise ExtractorEvaluationError("Apple evaluation suite is unsupported")
+    if not _LOCALE.fullmatch(locale) or max_tokens <= 0 or not enabled_profile_ids:
+        raise ExtractorEvaluationError("Apple evaluation configuration is invalid")
+    root = repo_root.resolve()
+    manifest, manifest_hash = _load_evaluation_manifest(root, suite)
+    rows, capabilities, dataset_fingerprint = _load_suite(
+        root, suite, primary_currency=primary_currency
+    )
+    _require_unique_rows(rows)
+    catalog, catalog_hash = _load_account_catalog(root, account_catalog)
+    prompt_path = _required_asset(root, APPLE_PROMPT_PATH, "Apple extractor instructions")
+    schema_path = _required_asset(root, APPLE_SCHEMA_PATH, "Apple guided schema")
+    try:
+        instructions_template = prompt_path.read_text(encoding="utf-8")
+        instructions = (
+            instructions_template + f"\nThe person's locale is {locale}. Respond in English.\n"
+        )
+        schema = json.loads(
+            schema_path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys
+        )
+        if set(schema["required"]) != set(APPLE_FLAT_FIELDS) or set(
+            schema["properties"]
+        ) != set(APPLE_FLAT_FIELDS):
+            raise ValueError("guided schema fields differ")
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise ExtractorEvaluationError("Apple guided schema or instructions are invalid") from exc
+
+    active_provider = provider if provider is not None else AppleFMProvider()
+    provider_id = getattr(active_provider, "provider_id", None)
+    runtime_version = getattr(active_provider, "runtime_version", None)
+    if (
+        not isinstance(provider_id, str)
+        or not provider_id
+        or not isinstance(runtime_version, str)
+        or not runtime_version
+    ):
+        raise ExtractorEvaluationError("Apple provider identity is invalid")
+    simulated = provider is not None
+    runtime_meta = {
+        "name": provider_id,
+        "version": runtime_version,
+        "model_identity_kind": "system_managed_runtime" if not simulated else "fake_provider",
+        "model_identifier": (
+            "SystemLanguageModel.general" if not simulated else "fake-provider-no-apple-model"
+        ),
+        "model_revision": None,
+        "model_file_sha256": None,
+        "os": platform.mac_ver()[0] if not simulated else "simulated",
+        "hardware": platform.machine() if not simulated else "simulated",
+        "os_build": _mac_system_fact("sw_vers", "-buildVersion") if not simulated else "simulated",
+        "hardware_model": (
+            _mac_system_fact("sysctl", "-n", "hw.model") if not simulated else "simulated"
+        ),
+        "locale": locale,
+        "locale_preflight": "not_exposed_by_python_sdk; unsupported locale errors are captured",
+        "simulated": simulated,
+    }
+    provenance = {
+        "lane": "apple_fm_python",
+        "suite": suite,
+        "evaluation_version": EVALUATION_CONTRACT,
+        "scoring_version": SCORING_VERSION,
+        "semantic_contract": manifest["semantic_contract"],
+        "output_contract": manifest["lanes"]["apple_fm_python"]["output_contract"],
+        "prompt_version": manifest["lanes"]["apple_fm_python"]["prompt_version"],
+        "schema_version": manifest["lanes"]["apple_fm_python"]["schema_version"],
+        "dataset_version": manifest["cohorts"][suite]["version"],
+        "dataset_fingerprint": dataset_fingerprint,
+        "runtime": runtime_meta,
+        "assets": {
+            "suite_manifest_sha256": manifest_hash,
+            "prompt_sha256": file_sha256(prompt_path),
+            "effective_instructions_sha256": object_sha256(instructions),
+            "schema_sha256": file_sha256(schema_path),
+            "account_catalog_sha256": catalog_hash,
+            "evaluator_sha256": file_sha256(Path(__file__)),
+            "strict_parser_sha256": file_sha256(root / "src/pocketfinancer_sms/extractor.py"),
+            "strict_extractor_schema_sha256": file_sha256(root / SCHEMA_PATH),
+        },
+        "inference": {
+            "max_tokens": max_tokens,
+            "sampling": "greedy",
+            "guided_generation": True,
+            "apply_prefilter": apply_prefilter,
+            "prefilter_policy": PREFILTER_POLICY_ID if apply_prefilter else None,
+            "primary_currency": primary_currency,
+            "enabled_profile_ids": list(enabled_profile_ids),
+            "case_context": "new_session_per_case",
+            "cumulative_guided_snapshots": "unavailable_in_python_sdk",
+            "decoded_tokens": "unavailable",
+            "logits": "unavailable",
+            "confidence": "unavailable",
+            "context_size": "unavailable",
+            "token_throughput": "unavailable",
+        },
+    }
+    configuration_hash = object_sha256(provenance)
+    private_output = require_private_output(root, _resolve_user_path(root, output_dir))
+    ensure_private_directory(private_output)
+    _refuse_unsafe_output_reuse(private_output)
+    checkpoint_path = private_output / "checkpoint.json"
+    completed = _load_checkpoint(
+        checkpoint_path,
+        configuration_hash=configuration_hash,
+        dataset_fingerprint=dataset_fingerprint,
+        row_ids={row.row_id for row in rows},
+    )
+    _validate_existing_report(
+        private_output / "report.json",
+        configuration_hash=configuration_hash,
+        dataset_fingerprint=dataset_fingerprint,
+    )
+
+    def invoke_apple(row: EvaluationRow, extractor_input: Mapping[str, Any]) -> dict[str, Any]:
+        request = json.dumps(extractor_input, ensure_ascii=False, separators=(",", ":"))
+        started = time.perf_counter()
+        try:
+            flat = asyncio.run(
+                active_provider.infer(
+                    instructions=instructions,
+                    prompt=request,
+                    schema=schema,
+                    max_tokens=max_tokens,
+                )
+            )
+            mapped = project_apple_fm_flat_output(flat)
+            raw = json.dumps(mapped, ensure_ascii=False, separators=(",", ":"))
+            record = _parse_record(
+                row,
+                raw,
+                (time.perf_counter() - started) * 1000.0,
+                primary_currency=primary_currency,
+                enabled_profile_ids=enabled_profile_ids,
+                catalog=catalog,
+                usage={},
+            )
+            record["guided_output"] = dict(flat)
+            record["validation_stages"] = {
+                "guided_schema": "complete",
+                "mapping": "complete",
+                "strict_parser": "accepted" if record["reason_code"] is None else "rejected",
+            }
+            return record
+        except KeyboardInterrupt:
+            raise
+        except (TypeError, ValueError) as exc:
+            return _failed_record(
+                row,
+                (time.perf_counter() - started) * 1000.0,
+                "malformed",
+                _apple_error_code(exc),
+            )
+        except Exception as exc:
+            return _failed_record(
+                row,
+                (time.perf_counter() - started) * 1000.0,
+                "runtime_failure",
+                _apple_error_code(exc),
+            )
+
+    return _execute_rows(
+        rows=rows,
+        completed=completed,
+        checkpoint_path=checkpoint_path,
+        report_path=private_output / "report.json",
+        configuration_hash=configuration_hash,
+        dataset_fingerprint=dataset_fingerprint,
+        provenance=provenance,
+        capabilities=capabilities,
+        suite=suite,
+        primary_currency=primary_currency,
+        enabled_profile_ids=enabled_profile_ids,
+        apply_prefilter=apply_prefilter,
+        invoke_row=invoke_apple,
+    )
+
+
+def _execute_rows(
+    *,
+    rows: Sequence[EvaluationRow],
+    completed: dict[str, dict[str, Any]],
+    checkpoint_path: Path,
+    report_path: Path,
+    configuration_hash: str,
+    dataset_fingerprint: str,
+    provenance: Mapping[str, Any],
+    capabilities: Mapping[str, Any],
+    suite: str,
+    primary_currency: str,
+    enabled_profile_ids: tuple[str, ...],
+    apply_prefilter: bool,
+    invoke_row: Callable[[EvaluationRow, Mapping[str, Any]], dict[str, Any]],
+) -> dict[str, Any]:
     analyzer = DeterministicSmsAnalyzer(
-        CurrencyContext(primary_currency, tuple(enabled_profile_ids)),
+        CurrencyContext(primary_currency, enabled_profile_ids),
         analysis_contract=ANALYSIS_CONTRACT_V2,
     )
     checkpoint = {
@@ -251,6 +650,28 @@ def evaluate_extractor(
         for row in rows:
             if row.row_id in completed:
                 continue
+            if apply_prefilter:
+                started = time.perf_counter()
+                pf = prefilter(row.source)
+                if pf.decision == "exclude":
+                    completed[row.row_id] = {
+                        "row_id": row.row_id,
+                        "outcome": "none",
+                        "reason_code": f"prefilter_{pf.reason}",
+                        "prefilter_excluded": True,
+                        "prefilter_reason": pf.reason,
+                        "model_invoked": False,
+                        "latency_ms": (time.perf_counter() - started) * 1000.0,
+                        "prediction": {"decision": "none"},
+                        "gold": dict(row.gold) if row.gold is not None else None,
+                        "groups": dict(row.groups),
+                        "account_resolution": None,
+                        "usage": {},
+                        "raw_output": None,
+                    }
+                    checkpoint["records"] = completed
+                    atomic_write_json(checkpoint_path, checkpoint)
+                    continue
             analysis = row.analysis
             if analysis is None or analysis.contract != ANALYSIS_CONTRACT_V2:
                 analysis = analyzer.analyze(
@@ -265,59 +686,12 @@ def evaluate_extractor(
                 analysis,
                 sender_family=row.sender_family,
                 primary_currency=primary_currency,
-                enabled_profile_ids=tuple(enabled_profile_ids),
+                enabled_profile_ids=enabled_profile_ids,
             )
-            started = time.perf_counter()
-            try:
-                response = model.create_chat_completion(
-                    messages=(
-                        {"role": "system", "content": prompt},
-                        {
-                            "role": "user",
-                            "content": json.dumps(
-                                extractor_input,
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                            ),
-                        },
-                    ),
-                    temperature=0.0,
-                    max_tokens=max_tokens,
-                    grammar=grammar,
-                    seed=seed,
-                )
-                latency_ms = (time.perf_counter() - started) * 1000.0
-                raw_output, finish_reason, usage = _chat_response(response)
-                if finish_reason == "length":
-                    result = _failed_record(
-                        row,
-                        latency_ms,
-                        "runtime_failure",
-                        "runtime_output_truncated",
-                        raw_output=raw_output,
-                        usage=usage,
-                    )
-                else:
-                    result = _parse_record(
-                        row,
-                        raw_output,
-                        latency_ms,
-                        primary_currency=primary_currency,
-                        enabled_profile_ids=enabled_profile_ids,
-                        catalog=catalog,
-                        usage=usage,
-                    )
-            except KeyboardInterrupt:
-                raise
-            except Exception:
-                latency_ms = (time.perf_counter() - started) * 1000.0
-                result = _failed_record(
-                    row,
-                    latency_ms,
-                    "runtime_failure",
-                    "runtime_failure",
-                )
-            completed[row.row_id] = result
+            record = invoke_row(row, extractor_input)
+            record.setdefault("prefilter_excluded", False)
+            record.setdefault("model_invoked", True)
+            completed[row.row_id] = record
             checkpoint["records"] = completed
             atomic_write_json(checkpoint_path, checkpoint)
     except KeyboardInterrupt as exc:
@@ -333,11 +707,8 @@ def evaluate_extractor(
             records=completed,
             status="interrupted",
         )
-        atomic_write_json(private_output / "report.json", partial_report)
+        atomic_write_json(report_path, partial_report)
         raise EvaluationInterrupted(len(completed), len(rows)) from exc
-    finally:
-        del model
-
     checkpoint["status"] = "complete"
     atomic_write_json(checkpoint_path, checkpoint)
     report = _build_report(
@@ -349,8 +720,41 @@ def evaluate_extractor(
         records=completed,
         status="complete",
     )
-    atomic_write_json(private_output / "report.json", report)
+    atomic_write_json(report_path, report)
     return _aggregate_summary(report)
+
+
+def _mac_system_fact(*command: str) -> str:
+    try:
+        result = subprocess_run(command)
+    except Exception:
+        return "unavailable"
+    return result if re.fullmatch(r"[A-Za-z0-9.,_-]{1,80}", result) else "unavailable"
+
+
+def subprocess_run(command: tuple[str, ...]) -> str:
+    import subprocess
+
+    result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=3)
+    return result.stdout.strip()
+
+
+def _apple_error_code(exc: Exception) -> str:
+    known = {
+        "UnsupportedLanguageOrLocaleError": "apple_unsupported_locale",
+        "GuardrailViolationError": "apple_guardrail_violation",
+        "RefusalError": "apple_refusal",
+        "ExceededContextWindowSizeError": "apple_context_exceeded",
+        "AssetsUnavailableError": "apple_assets_unavailable",
+        "InvalidGenerationSchemaError": "apple_guided_schema_incompatible",
+        "DecodingFailureError": "apple_decoding_failure",
+    }
+    return known.get(
+        type(exc).__name__,
+        "apple_guided_result_invalid"
+        if isinstance(exc, (TypeError, ValueError))
+        else "apple_runtime_failure",
+    )
 
 
 def _resolve_user_path(root: Path, path: Path) -> Path:
@@ -382,8 +786,6 @@ def _refuse_unsafe_output_reuse(output_dir: Path) -> None:
         raise ExtractorEvaluationError("nonempty evaluation output cannot be reused")
     if (output_dir / "report.json").exists() and not (output_dir / "checkpoint.json").exists():
         raise ExtractorEvaluationError("nonempty evaluation output cannot be reused")
-    # A process killed during an atomic write may leave a temporary file. The
-    # durable checkpoint remains the only authority for completed case IDs.
     for path in paths:
         if _ATOMIC_TEMP.fullmatch(path.name):
             if not path.is_file():
@@ -460,10 +862,8 @@ def _load_evaluation_manifest(root: Path, suite: str) -> tuple[dict[str, Any], s
         if (
             lanes["android_target_gguf"]["prompt"] != PROMPT_PATH.as_posix()
             or lanes["android_target_gguf"]["schema"] != SCHEMA_PATH.as_posix()
-            or lanes["apple_fm_python"]["prompt"]
-            != "configs/sms_processing/prompts/apple-fm-sms-extractor-v1.txt"
-            or lanes["apple_fm_python"]["schema"]
-            != "configs/sms_processing/evaluations/apple-fm-flat-v1.schema.json"
+            or lanes["apple_fm_python"]["prompt"] != APPLE_PROMPT_PATH.as_posix()
+            or lanes["apple_fm_python"]["schema"] != APPLE_SCHEMA_PATH.as_posix()
         ):
             raise ValueError("lane asset path mismatch")
         expected_path = {
@@ -762,7 +1162,6 @@ def _load_private_canonical(
             "accuracy includes submitted/adjudicated human-gold rows only",
             "unlabelled rows contribute only outcome and latency rates",
             "private sender/template groups below the suppression threshold are hidden",
-            "native receipt-time and Apple Foundation Models behavior require separate evaluation",
         ],
     }
     return rows, {"corpus_run_id": run_id, "rows": binding_rows}, capabilities
@@ -1022,6 +1421,8 @@ def _parse_record(
         "row_id": row.row_id,
         "outcome": prediction["decision"],
         "reason_code": None,
+        "prefilter_excluded": False,
+        "model_invoked": True,
         "latency_ms": latency_ms,
         "prediction": prediction,
         "gold": dict(row.gold) if row.gold is not None else None,
@@ -1045,6 +1446,8 @@ def _failed_record(
         "row_id": row.row_id,
         "outcome": outcome,
         "reason_code": reason_code,
+        "prefilter_excluded": False,
+        "model_invoked": True,
         "latency_ms": latency_ms,
         "prediction": None,
         "gold": dict(row.gold) if row.gold is not None else None,
@@ -1205,9 +1608,9 @@ def _build_report(
         "configuration_sha256": configuration_hash,
         "provenance": dict(provenance),
         "contract_differences": {
-            "gguf": "embedded chat template, direct extractor JSON, GBNF, observable model file hash",
-            "apple": "system-managed model, guided flat schema mapped to strict extractor JSON; guided snapshots and model-file hash unavailable in Python SDK",
-            "comparison": "same declared cohort and host parser/scoring; prompts and output protocols differ, so results are non-causal",
+            "gguf": "embedded chat template, direct extractor JSON, optional GBNF, observable model hash",
+            "apple": "system-managed model, guided flat schema mapped to strict extractor JSON",
+            "comparison": "same declared cohort, prefilter, and host parser/scoring",
         },
         "capabilities": adjusted_capabilities,
         "production_readiness_claim": False,
@@ -1254,9 +1657,8 @@ def _metrics(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         for record in records
         if record.get("account_resolution") is not None
     ]
-    outcome_names = observed_outcomes
     outcomes = {
-        name: sum(record["outcome"] == name for record in records) for name in outcome_names
+        name: sum(record["outcome"] == name for record in records) for name in observed_outcomes
     }
     reason_code_counts: dict[str, int] = {}
     for record in records:
@@ -1264,6 +1666,12 @@ def _metrics(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         if reason:
             reason_code_counts[str(reason)] = reason_code_counts.get(str(reason), 0) + 1
     count = len(records)
+    prefilter_excluded_count = sum(bool(record.get("prefilter_excluded")) for record in records)
+    avoided_model_calls = sum(record.get("model_invoked") is False for record in records)
+    false_exclusions = sum(
+        bool(record.get("prefilter_excluded")) and record["gold"]["decision"] == "posted"
+        for record in labelled
+    )
     rejected_grounding = sum(
         str(record.get("reason_code") or "").startswith("extractor_evidence_") for record in records
     )
@@ -1273,7 +1681,14 @@ def _metrics(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         for record in records
     )
     return {
+        "total_inputs": count,
         "labelled_count": len(labelled),
+        "prefilter": {
+            "excluded_count": prefilter_excluded_count,
+            "excluded_rate": _ratio(prefilter_excluded_count, count),
+            "avoided_model_calls": avoided_model_calls,
+            "false_exclusions": false_exclusions,
+        },
         "classification": {
             "correct_count": decision_correct,
             "eligible_count": len(labelled),
@@ -1345,12 +1760,7 @@ def _metrics(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 def _strict_gold_supported(gold: Mapping[str, Any]) -> bool:
     return gold.get("decision") == "posted" and all(
         gold.get(name) is not None
-        for name in (
-            "minor_units",
-            "currency",
-            "direction",
-            "account_reference",
-        )
+        for name in ("minor_units", "currency", "direction", "account_reference")
     )
 
 
@@ -1457,14 +1867,7 @@ def _grounding_valid(record: Mapping[str, Any]) -> bool:
 def _latency_summary(values: Sequence[float]) -> dict[str, Any]:
     ordered = sorted(values)
     if not ordered:
-        return {
-            "count": 0,
-            "mean": None,
-            "p50": None,
-            "p95": None,
-            "p99": None,
-            "max": None,
-        }
+        return {"count": 0, "mean": None, "p50": None, "p95": None, "p99": None, "max": None}
     return {
         "count": len(ordered),
         "mean": statistics.fmean(ordered),
@@ -1523,8 +1926,6 @@ def _group_metrics(records: Sequence[Mapping[str, Any]], *, suite: str) -> dict[
 
 
 def _aggregate_summary(report: Mapping[str, Any]) -> dict[str, Any]:
-    """Strip report content down to the aggregate-only CLI response."""
-
     return {
         "status": report["status"],
         "lane": report["lane"],
@@ -1535,3 +1936,571 @@ def _aggregate_summary(report: Mapping[str, Any]) -> dict[str, Any]:
         "metrics": report["metrics"],
         "production_readiness_claim": False,
     }
+
+
+# ---------------------------------------------------------------------------
+# Stateful supplied-response pipeline runner (isolated synthetic SQLite runs)
+# ---------------------------------------------------------------------------
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _host_source_hashes() -> dict[str, str]:
+    root = Path(__file__).parent
+    return {
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+        for name in (
+            "evaluation.py", "admission.py", "prefilter.py", "processing.py",
+            "extractor.py", "analyzer.py", "account_resolution.py", "currency.py",
+            "structural_text.py", "profiles.py", "types.py", "feedback.py", "corpus/grouping.py",
+        )
+    }
+
+
+def _hash(value: Any) -> str:
+    return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class InventedMessage:
+    body: str
+    sender: str
+    received_at_epoch_ms: int
+    connector: str | None = None
+    source_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.body or len(self.body.encode("utf-8")) > 16_384:
+            raise ValueError("invalid invented body")
+        if type(self.received_at_epoch_ms) is not int or self.received_at_epoch_ms < 0:
+            raise ValueError("invalid receipt time")
+        if (self.connector is None) != (self.source_id is None):
+            raise ValueError("source identity requires both connector and ID")
+        if self.connector == "" or self.source_id == "":
+            raise ValueError("source identity must not be empty")
+
+    @property
+    def reliable_key(self) -> str | None:
+        if self.source_id is None:
+            return None
+        return _hash([self.connector, self.source_id])
+
+
+@dataclass(frozen=True)
+class RunReceipt:
+    operation_id: str
+    action: str
+    route: str
+    model_invoked: bool = False
+
+
+class SuppliedRuntime:
+    """Counted fake runtime; responses are supplied, never inferred or repaired."""
+
+    def __init__(self, responses: list[str | Exception]) -> None:
+        self.responses = list(responses)
+        self.calls = 0
+        self.requests: list[dict[str, Any]] = []
+
+    def __call__(self, request: dict[str, Any], _cancellation: Any) -> str:
+        self.calls += 1
+        self.requests.append(request)
+        if not self.responses:
+            raise RuntimeError("no supplied response")
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class SyntheticPipelineRun:
+    """Isolated end-to-end stateful SQLite pipeline runner for mechanics testing."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        primary_currency: str = "INR",
+        enabled_profiles: tuple[str, ...] = ("core-en", "india"),
+        duplicate_window_ms: int = DUPLICATE_WINDOW_MS,
+        resume: bool = False,
+    ) -> None:
+        self.settings = {
+            "contract": RUN_CONTRACT,
+            "primary_currency": primary_currency,
+            "enabled_profiles": list(enabled_profiles),
+            "prefilter": PREFILTER_POLICY_ID,
+            "duplicate_window_ms": duplicate_window_ms,
+            "host_source_hashes": _host_source_hashes(),
+        }
+        context = CurrencyContext(primary_currency, enabled_profiles)
+        self.settings["primary_currency"] = context.primary_currency
+        self.settings["analyzer_configuration_hash"] = context.config_hash
+        self.duplicate_window_ms = duplicate_window_ms
+        if path.is_symlink() or (resume and not path.is_file()):
+            raise ValueError("resume requires an existing regular run file")
+        if not resume:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
+        self.db = sqlite3.connect(path, isolation_level=None)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA foreign_keys = ON")
+        self.db.execute("PRAGMA busy_timeout = 5000")
+        try:
+            if not resume:
+                self.db.executescript("""
+                    CREATE TABLE run (configuration TEXT NOT NULL);
+                    CREATE TABLE operations (
+                        id TEXT PRIMARY KEY, source_key TEXT,
+                        evidence_digest TEXT NOT NULL, evidence TEXT,
+                        body_retained INTEGER NOT NULL,
+                        settings TEXT NOT NULL, parent_id TEXT REFERENCES operations(id),
+                        state TEXT NOT NULL, route TEXT NOT NULL,
+                        payload TEXT, fingerprint TEXT
+                    );
+                    CREATE UNIQUE INDEX ordinary_source ON operations(source_key)
+                        WHERE parent_id IS NULL AND source_key IS NOT NULL;
+                    CREATE TABLE admissions (
+                        operation_id TEXT NOT NULL REFERENCES operations(id),
+                        action TEXT NOT NULL, route TEXT NOT NULL
+                    );
+                    CREATE TABLE attempts (
+                        operation_id TEXT PRIMARY KEY REFERENCES operations(id),
+                        raw_output TEXT
+                    );
+                    CREATE TABLE accounts (
+                        id TEXT PRIMARY KEY, kind TEXT NOT NULL, aliases TEXT NOT NULL
+                    );
+                    CREATE TABLE ledger (
+                        source_key TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE,
+                        account_id TEXT NOT NULL REFERENCES accounts(id),
+                        direction TEXT NOT NULL, minor_units INTEGER NOT NULL,
+                        currency TEXT NOT NULL, received_at_epoch_ms INTEGER NOT NULL,
+                        payload TEXT NOT NULL
+                    );
+                """)
+                self.db.execute("INSERT INTO run VALUES (?)", (_json(self.settings),))
+            rows = self.db.execute("SELECT configuration FROM run").fetchall()
+            if len(rows) != 1 or rows[0][0] != _json(self.settings):
+                raise ValueError("run configuration mismatch; create a fresh isolated run")
+        except BaseException:
+            self.db.close()
+            raise
+
+    def close(self) -> None:
+        self.db.close()
+
+    def admit(self, message: InventedMessage, *, retry_of: str | None = None) -> RunReceipt:
+        from .admission import admission_action
+
+        evidence = _json(asdict(message))
+        evidence_digest = _hash(asdict(message))
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            existing = None
+            if retry_of is not None:
+                existing = self._operation(retry_of)
+                if self.db.execute(
+                    "SELECT 1 FROM operations WHERE parent_id = ?", (retry_of,)
+                ).fetchone():
+                    raise ValueError("retry must target the latest operation")
+                if not existing["body_retained"]:
+                    raise ValueError("tombstoned operation has no body to retry")
+            elif message.reliable_key is not None:
+                existing = self.db.execute(
+                    "SELECT * FROM operations WHERE source_key = ? ORDER BY rowid DESC LIMIT 1",
+                    (message.reliable_key,),
+                ).fetchone()
+            action = admission_action(
+                reliable_identity=message.reliable_key is not None,
+                existing_state=existing["state"] if existing else None,
+                same_evidence=existing["evidence_digest"] == evidence_digest if existing else True,
+                owner_retry=retry_of is not None,
+            )
+            if action == "conflict":
+                raise ValueError("source identity conflicts with immutable evidence")
+            if action in {"reuse", "resume", "in_flight"}:
+                assert existing is not None
+                receipt = RunReceipt(existing["id"], action, existing["route"])
+            else:
+                operation_id = str(uuid.uuid4())
+                decision = prefilter(message.body)
+                excluded = decision.decision == "exclude"
+                self.db.execute(
+                    "INSERT INTO operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                    (
+                        operation_id,
+                        message.reliable_key,
+                        evidence_digest,
+                        None if excluded else evidence,
+                        0 if excluded else 1,
+                        _json(self.settings),
+                        retry_of,
+                        "settled" if excluded else "ready",
+                        "tombstoned_excluded" if excluded else "pending",
+                        _json({"prefilter_reason": decision.reason}) if excluded else None,
+                    ),
+                )
+                receipt = RunReceipt(
+                    operation_id, action, "tombstoned_excluded" if excluded else "pending"
+                )
+            self.db.execute(
+                "INSERT INTO admissions VALUES (?, ?, ?)",
+                (receipt.operation_id, receipt.action, receipt.route),
+            )
+            self.db.execute("COMMIT")
+            return receipt
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+
+    def execute(self, operation_id: str, runtime: SuppliedRuntime) -> RunReceipt:
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._operation(operation_id)
+            if row["state"] != "ready":
+                self.db.execute("COMMIT")
+                return RunReceipt(
+                    operation_id,
+                    "in_flight" if row["state"] == "in_flight" else "reuse",
+                    row["route"],
+                )
+            if self.db.execute(
+                "SELECT 1 FROM operations WHERE parent_id = ?", (operation_id,)
+            ).fetchone():
+                self.db.execute("COMMIT")
+                return RunReceipt(operation_id, "reuse", "superseded")
+            if not row["evidence"]:
+                raise ValueError("cannot execute operation without retained source evidence")
+            self.db.execute(
+                "UPDATE operations SET state = 'in_flight' WHERE id = ?", (operation_id,)
+            )
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        settings = json.loads(row["settings"])
+        message = InventedMessage(**json.loads(row["evidence"]))
+        profiles = tuple(settings["enabled_profiles"])
+        catalog = tuple(
+            AccountCatalogEntry(item["id"], item["kind"], tuple(json.loads(item["aliases"])))
+            for item in self.db.execute("SELECT * FROM accounts ORDER BY id")
+        )
+        recent = self._recent_transactions(exclude_operation_id=operation_id)
+        coordinator = ExtractionCoordinator(
+            DeterministicSmsAnalyzer(
+                CurrencyContext(settings["primary_currency"], profiles),
+                analysis_contract=ANALYSIS_CONTRACT_V2,
+            ),
+            runtime,
+            primary_currency=settings["primary_currency"],
+            enabled_profile_ids=profiles,
+            account_catalog=catalog,
+            apply_prefilter=False,
+            duplicate_window_ms=self.duplicate_window_ms,
+        )
+
+        def invoke(request: dict[str, Any], cancellation: Any) -> str:
+            self.db.execute("INSERT INTO attempts VALUES (?, NULL)", (operation_id,))
+            raw = runtime(request, cancellation)
+            self.db.execute(
+                "UPDATE attempts SET raw_output = ? WHERE operation_id = ?",
+                (_json(raw), operation_id),
+            )
+            return raw
+
+        coordinator.model_invoke = invoke
+        calls_before = runtime.calls
+        try:
+            outcome = coordinator.process(
+                source=message.body,
+                raw_sender=message.sender,
+                operation_id=operation_id,
+                operation_config_hash=_hash(settings),
+                received_at_epoch_ms=message.received_at_epoch_ms,
+                received_timestamp_provenance=TimestampProvenance.PLATFORM_RECEIVED,
+                source_event_key=row["source_key"] or operation_id,
+                idempotency_key=operation_id,
+                persisted_source_event_keys=frozenset(
+                    item[0] for item in self.db.execute("SELECT source_key FROM ledger")
+                ),
+                recent_transactions=recent,
+                current_source_id=row["source_key"],
+            )
+            self.db.execute("BEGIN IMMEDIATE")
+            if self._operation(operation_id)["state"] != "in_flight":
+                raise ValueError("runtime ownership was interrupted")
+            if outcome.status == "eligible":
+                persisted_sources = frozenset(
+                    item[0] for item in self.db.execute("SELECT source_key FROM ledger")
+                )
+                recent_locked = self._recent_transactions(exclude_operation_id=operation_id)
+                assert outcome.result and outcome.result.transaction and outcome.account_resolution
+                tx = outcome.result.transaction
+                dup_hit = is_within_duplicate_window(
+                    minor_units=tx.minor_units,
+                    currency=tx.currency,
+                    direction=tx.direction.value,
+                    account_id=outcome.account_resolution.account_id,
+                    received_at_epoch_ms=message.received_at_epoch_ms,
+                    recent_transactions=recent_locked,
+                    current_source_id=row["source_key"],
+                    current_operation_id=operation_id,
+                    window_ms=self.duplicate_window_ms,
+                )
+                if dup_hit or (row["source_key"] or operation_id) in persisted_sources:
+                    raw = self.db.execute(
+                        "SELECT raw_output FROM attempts WHERE operation_id = ?", (operation_id,)
+                    ).fetchone()[0]
+                    coordinator.model_invoke = lambda *_args: json.loads(raw)
+                    outcome = coordinator.process(
+                        source=message.body,
+                        raw_sender=message.sender,
+                        operation_id=operation_id,
+                        operation_config_hash=_hash(settings),
+                        received_at_epoch_ms=message.received_at_epoch_ms,
+                        received_timestamp_provenance=TimestampProvenance.PLATFORM_RECEIVED,
+                        source_event_key=row["source_key"] or operation_id,
+                        idempotency_key=operation_id,
+                        persisted_source_event_keys=persisted_sources,
+                        recent_transactions=recent_locked,
+                        current_source_id=row["source_key"],
+                    )
+            payload = processing_result_payload(outcome)
+            payload["review"] = outcome.review_case.to_dict() if outcome.review_case else None
+            route = {
+                "eligible": "transactions",
+                "tombstoned_none": "tombstoned_none",
+                "tombstoned_excluded": "tombstoned_excluded",
+            }.get(outcome.status, "review")
+            fingerprint = (
+                outcome.duplicate_assessment.transaction_fingerprint
+                if outcome.result and outcome.result.transaction and outcome.duplicate_assessment
+                else None
+            )
+            if route == "transactions":
+                assert (
+                    outcome.account_resolution
+                    and outcome.account_resolution.account_id
+                    and outcome.result
+                    and outcome.result.transaction
+                )
+                tx = outcome.result.transaction
+                self._save(
+                    row,
+                    outcome.account_resolution.account_id,
+                    tx.direction.value,
+                    tx.minor_units,
+                    tx.currency,
+                    message.received_at_epoch_ms,
+                    payload,
+                )
+            body_retained = 1 if outcome.body_retained else 0
+            retained_evidence = row["evidence"] if outcome.body_retained else None
+            if not outcome.body_retained:
+                payload["review"] = None
+            self.db.execute(
+                "UPDATE operations SET state = 'settled', route = ?, payload = ?, "
+                "fingerprint = ?, evidence = ?, body_retained = ? WHERE id = ?",
+                (route, _json(payload), fingerprint, retained_evidence, body_retained, operation_id),
+            )
+            self.db.execute("COMMIT")
+        except BaseException:
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
+            self.db.execute(
+                "UPDATE operations SET state = 'interrupted', route = 'retryable' "
+                "WHERE id = ? AND state = 'in_flight'",
+                (operation_id,),
+            )
+            raise
+        return RunReceipt(operation_id, "execute", route, runtime.calls > calls_before)
+
+    def recover_interrupted(self) -> int:
+        return self.db.execute(
+            "UPDATE operations SET state = 'interrupted', route = 'retryable' "
+            "WHERE state = 'in_flight'"
+        ).rowcount
+
+    def confirm_account(self, operation_id: str, account_id: str, *, kind: str = "bank_account") -> None:
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._operation(operation_id)
+            if self.db.execute(
+                "SELECT 1 FROM operations WHERE parent_id = ?", (operation_id,)
+            ).fetchone():
+                raise ValueError("confirmation must target the latest operation")
+            payload = json.loads(row["payload"] or "null")
+            if row["route"] != "review" or not payload or payload["recognition_decision"] != "posted":
+                raise ValueError("confirmation requires a validated posted Review")
+            if payload["reason_codes"] != ["account_resolution_unresolved"]:
+                raise ValueError("other Review reasons require separate resolution")
+            semantic = payload["semantic_result"]
+            received_ms = payload["receipt_timestamp"]["epoch_ms"]
+            recent = self._recent_transactions(exclude_operation_id=operation_id)
+            if is_within_duplicate_window(
+                minor_units=semantic["money"]["minor_units"],
+                currency=semantic["money"]["currency"],
+                direction=semantic["direction"],
+                account_id=account_id,
+                received_at_epoch_ms=received_ms,
+                recent_transactions=recent,
+                current_source_id=row["source_key"],
+                current_operation_id=operation_id,
+                window_ms=self.duplicate_window_ms,
+            ):
+                raise ValueError("possible duplicate requires separate owner resolution")
+            reference = semantic["account_reference"]
+            entry = AccountCatalogEntry(account_id, kind, (reference,))
+            existing = self.db.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
+            aliases = list(json.loads(existing["aliases"])) if existing else []
+            if existing and existing["kind"] != kind:
+                raise ValueError("account type conflict")
+            if reference not in aliases:
+                aliases.append(reference)
+            for other in self.db.execute("SELECT * FROM accounts WHERE id != ?", (account_id,)):
+                if any(
+                    normalize_account_alias(alias) == normalize_account_alias(reference)
+                    for alias in json.loads(other["aliases"])
+                ):
+                    raise ValueError("account alias already belongs to another account")
+            self.db.execute(
+                "INSERT INTO accounts VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET aliases=excluded.aliases",
+                (entry.account_id, entry.account_type, _json(aliases)),
+            )
+            self._save(
+                row,
+                account_id,
+                semantic["direction"],
+                semantic["money"]["minor_units"],
+                semantic["money"]["currency"],
+                received_ms,
+                payload,
+            )
+            fingerprint = transaction_fingerprint(
+                minor_units=semantic["money"]["minor_units"],
+                currency=semantic["money"]["currency"],
+                direction=semantic["direction"],
+                account_id=account_id,
+                received_at_epoch_ms=received_ms,
+            )
+            self.db.execute(
+                "UPDATE operations SET route = 'transactions', fingerprint = ? WHERE id = ?",
+                (fingerprint, operation_id),
+            )
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+
+    def resolve_duplicate(self, operation_id: str, *, action: str) -> None:
+        if action not in {"separate", "dismiss"}:
+            raise ValueError("duplicate resolution action must be 'separate' or 'dismiss'")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._operation(operation_id)
+            if self.db.execute(
+                "SELECT 1 FROM operations WHERE parent_id = ?", (operation_id,)
+            ).fetchone():
+                raise ValueError("resolution must target the latest operation")
+            payload = json.loads(row["payload"] or "null")
+            if row["route"] != "review" or not payload or payload.get("reason_codes") != ["duplicate_possible"]:
+                raise ValueError("duplicate resolution requires a duplicate_possible Review")
+            if action == "dismiss":
+                self.db.execute(
+                    "UPDATE operations SET route = 'tombstoned_none', evidence = NULL, "
+                    "body_retained = 0 WHERE id = ?",
+                    (operation_id,),
+                )
+            else:
+                semantic = payload["semantic_result"]
+                account_id = payload["account_resolution"]["account_id"]
+                received_ms = payload["receipt_timestamp"]["epoch_ms"]
+                self._save(
+                    row,
+                    account_id,
+                    semantic["direction"],
+                    semantic["money"]["minor_units"],
+                    semantic["money"]["currency"],
+                    received_ms,
+                    payload,
+                )
+                self.db.execute(
+                    "UPDATE operations SET route = 'transactions' WHERE id = ?",
+                    (operation_id,),
+                )
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+
+    def mechanics_summary(self) -> dict[str, int]:
+        return {
+            "inputs": self.db.execute("SELECT COUNT(*) FROM admissions").fetchone()[0],
+            "operations": self.db.execute("SELECT COUNT(*) FROM operations").fetchone()[0],
+            "model_calls": self.db.execute("SELECT COUNT(*) FROM attempts").fetchone()[0],
+            "excluded_inputs": self.db.execute(
+                "SELECT COUNT(*) FROM admissions WHERE route = 'tombstoned_excluded'"
+            ).fetchone()[0],
+            "tombstoned_none": self.db.execute(
+                "SELECT COUNT(*) FROM operations WHERE route = 'tombstoned_none'"
+            ).fetchone()[0],
+            "reused_inputs": self.db.execute(
+                "SELECT COUNT(*) FROM admissions WHERE action IN ('reuse', 'in_flight')"
+            ).fetchone()[0],
+            "transactions": self.db.execute("SELECT COUNT(*) FROM ledger").fetchone()[0],
+            "review_operations": self.db.execute(
+                "SELECT COUNT(*) FROM operations WHERE route = 'review'"
+            ).fetchone()[0],
+        }
+
+    def _recent_transactions(self, *, exclude_operation_id: str) -> list[RecentTransactionRecord]:
+        rows = self.db.execute(
+            "SELECT source_key, operation_id, account_id, direction, minor_units, currency, "
+            "received_at_epoch_ms FROM ledger WHERE operation_id != ?",
+            (exclude_operation_id,),
+        ).fetchall()
+        return [
+            RecentTransactionRecord(
+                account_id=r["account_id"],
+                direction=r["direction"],
+                minor_units=int(r["minor_units"]),
+                currency=r["currency"],
+                received_at_epoch_ms=int(r["received_at_epoch_ms"]),
+                source_id=r["source_key"],
+                operation_id=r["operation_id"],
+            )
+            for r in rows
+        ]
+
+    def _save(
+        self,
+        row: sqlite3.Row,
+        account_id: str,
+        direction: str,
+        minor_units: int,
+        currency: str,
+        received_at_epoch_ms: int,
+        payload: dict[str, Any],
+    ) -> None:
+        self.db.execute(
+            "INSERT INTO ledger VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row["source_key"] or row["id"],
+                row["id"],
+                account_id,
+                direction,
+                minor_units,
+                currency,
+                received_at_epoch_ms,
+                _json(payload),
+            ),
+        )
+
+    def _operation(self, operation_id: str) -> sqlite3.Row:
+        row = self.db.execute("SELECT * FROM operations WHERE id = ?", (operation_id,)).fetchone()
+        if row is None:
+            raise ValueError("unknown operation")
+        return row

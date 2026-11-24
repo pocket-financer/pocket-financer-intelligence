@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -11,6 +12,50 @@ from .extractor import normalize_account_reference
 
 
 ACCOUNT_RESOLUTION_PROFILE = "pocketfinancer.account-resolution-profile/1"
+DUPLICATE_WINDOW_MS = 300_000
+
+
+@dataclass(frozen=True, slots=True)
+class RecentTransactionRecord:
+    account_id: str | None
+    direction: str
+    minor_units: int
+    currency: str
+    received_at_epoch_ms: int
+    source_id: str | None = None
+    operation_id: str | None = None
+
+
+def is_within_duplicate_window(
+    *,
+    minor_units: int,
+    currency: str,
+    direction: str,
+    account_id: str | None,
+    received_at_epoch_ms: int,
+    recent_transactions: Sequence[RecentTransactionRecord],
+    current_source_id: str | None = None,
+    current_operation_id: str | None = None,
+    window_ms: int = DUPLICATE_WINDOW_MS,
+) -> bool:
+    """True when an existing persisted transaction matches within +/- window_ms."""
+
+    if account_id is None:
+        return False
+    for prior in recent_transactions:
+        if current_source_id is not None and prior.source_id == current_source_id:
+            continue
+        if current_operation_id is not None and prior.operation_id == current_operation_id:
+            continue
+        if (
+            prior.account_id == account_id
+            and prior.direction == direction
+            and prior.minor_units == minor_units
+            and prior.currency == currency
+            and abs(prior.received_at_epoch_ms - received_at_epoch_ms) <= window_ms
+        ):
+            return True
+    return False
 
 
 class ResolutionStatus(StrEnum):
@@ -156,13 +201,38 @@ def assess_duplicate(
     persisted_idempotency_keys: frozenset[str] = frozenset(),
     persisted_source_event_keys: frozenset[str] = frozenset(),
     known_transaction_fingerprints: frozenset[str] = frozenset(),
+    minor_units: int | None = None,
+    currency: str | None = None,
+    direction: str | None = None,
+    account_id: str | None = None,
+    received_at_epoch_ms: int | None = None,
+    recent_transactions: Sequence[RecentTransactionRecord] = (),
+    current_source_id: str | None = None,
+    current_operation_id: str | None = None,
+    window_ms: int = DUPLICATE_WINDOW_MS,
 ) -> DuplicateAssessment:
     if (
         idempotency_key in persisted_idempotency_keys
         or source_event_key in persisted_source_event_keys
     ):
         status = DuplicateStatus.ALREADY_PERSISTED
-    elif transaction_fingerprint_value in known_transaction_fingerprints:
+    elif (
+        minor_units is not None
+        and currency is not None
+        and direction is not None
+        and received_at_epoch_ms is not None
+        and is_within_duplicate_window(
+            minor_units=minor_units,
+            currency=currency,
+            direction=direction,
+            account_id=account_id,
+            received_at_epoch_ms=received_at_epoch_ms,
+            recent_transactions=recent_transactions,
+            current_source_id=current_source_id,
+            current_operation_id=current_operation_id,
+            window_ms=window_ms,
+        )
+    ) or transaction_fingerprint_value in known_transaction_fingerprints:
         status = DuplicateStatus.POSSIBLE_DUPLICATE
     else:
         status = DuplicateStatus.CLEAR

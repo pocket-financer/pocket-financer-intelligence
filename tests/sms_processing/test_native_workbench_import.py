@@ -17,7 +17,6 @@ from pocketfinancer_sms.analyzer import DeterministicSmsAnalyzer
 from pocketfinancer_sms.corpus.grouping import build_grouping
 from pocketfinancer_sms.currency import CurrencyContext
 from pocketfinancer_sms.provenance import PrivateArtifactError
-from pocketfinancer_sms.triage import evaluate_triage
 from pocketfinancer_sms.types import EvidenceSpan
 from pocketfinancer_sms.workbench.native_import import NativeTraceImporter
 from pocketfinancer_sms.workbench.secure_store import SecureWorkbenchStore
@@ -47,7 +46,6 @@ def _store(tmp_path: Path, pool: str) -> tuple[WorkbenchStore, str]:
     analysis = DeterministicSmsAnalyzer(
         CurrencyContext("INR", ("core-en", "india"))
     ).analyze(body, operation_id=source_id, is_outgoing=False)
-    triage = evaluate_triage(analysis)
     timestamp = "2024-03-01T00:00:00Z"
     grouping = build_grouping(b"native-import-key" * 2, body, "SYNTH", timestamp)
     record = {
@@ -63,14 +61,14 @@ def _store(tmp_path: Path, pool: str) -> tuple[WorkbenchStore, str]:
         },
         "analysis": analysis.to_dict(),
         "weak_facets": {
-            "disposition": triage.disposition.value,
-            "selector_action": triage.selector_action.value,
+            "disposition": "invoke",
+            "selector_action": "run_normal",
             "operational_class": "posted_candidate",
             "event_state": "posted",
             "financial_family": "merchant_payment",
             "payment_rail": "unknown",
             "confidence": "medium",
-            "reason_codes": list(triage.reason_codes),
+            "reason_codes": ["amount_and_direction_present"],
         },
         "grouping": asdict(grouping),
         "pool": pool,

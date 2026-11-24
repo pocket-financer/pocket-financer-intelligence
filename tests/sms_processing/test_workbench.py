@@ -13,7 +13,6 @@ from pocketfinancer_sms.corpus.grouping import build_grouping
 from pocketfinancer_sms.currency import CurrencyContext
 from pocketfinancer_sms.extractor import SourceSpan
 from pocketfinancer_sms.provenance import PrivateArtifactError, file_sha256
-from pocketfinancer_sms.triage import evaluate_triage
 from pocketfinancer_sms.types import CandidateKind
 from pocketfinancer_sms.workbench.service import WorkbenchService, WorkbenchValidationError
 from pocketfinancer_sms.workbench.store import WorkbenchConflict, WorkbenchStore
@@ -27,7 +26,6 @@ def _manifest_record(
     analysis = DeterministicSmsAnalyzer(CurrencyContext("INR", ("core-en", "india"))).analyze(
         source, operation_id=source_id, is_outgoing=False
     )
-    triage = evaluate_triage(analysis)
     grouping = build_grouping(b"synthetic-key" * 3, source, "SYNTH-BANK", "2024-01-01T00:00:00Z")
     return {
         "contract": "pocketfinancer.corpus-record/1",
@@ -42,14 +40,14 @@ def _manifest_record(
         },
         "analysis": analysis.to_dict(),
         "weak_facets": {
-            "disposition": triage.disposition.value,
-            "selector_action": triage.selector_action.value,
+            "disposition": "invoke",
+            "selector_action": "run_normal",
             "operational_class": "posted_candidate",
             "event_state": "posted",
             "financial_family": "bank_transfer",
             "payment_rail": "bank_internal",
             "confidence": "medium",
-            "reason_codes": list(triage.reason_codes),
+            "reason_codes": ["amount_and_direction_present"],
         },
         "grouping": asdict(grouping),
         "pool": pool,
@@ -162,7 +160,10 @@ def test_protected_review_is_blind_until_submission_and_explicit_reveal(tmp_path
     revealed = service.reveal(source_id, "reviewer-one")
     assert revealed["blind_locked"] is False
     assert revealed["analysis"]["analysis_id"] == record["analysis"]["analysis_id"]
-    assert service.target_preview(source_id, "reviewer-one")["convertible"] is True
+    assert service.target_preview(source_id, "reviewer-one") == {
+        "convertible": False,
+        "reason_code": "historical_selector_contract_retired",
+    }
 
 
 def test_revision_conflicts_and_invalid_submissions_never_downgrade_to_negative(
@@ -209,7 +210,7 @@ def test_revision_conflicts_and_invalid_submissions_never_downgrade_to_negative(
     assert row["annotation_history"][0]["status"] == "draft"
 
 
-def test_target_preview_reports_candidate_oracle_without_silent_fallback(tmp_path: Path) -> None:
+def test_target_preview_retires_historical_selector_contract(tmp_path: Path) -> None:
     store, record = _store(tmp_path, pool="annotation_training")
     service = WorkbenchService(store)
     service.submit(
@@ -220,14 +221,9 @@ def test_target_preview_reports_candidate_oracle_without_silent_fallback(tmp_pat
     )
 
     preview = service.target_preview(record["source_id"], "reviewer-one")
-    assert preview["convertible"] is True
-    assert preview["target"]["decision"] == "posted"
-    assert set(preview["target"]) == {
-        "decision",
-        "amount",
-        "direction",
-        "account",
-        "counterparty",
+    assert preview == {
+        "convertible": False,
+        "reason_code": "historical_selector_contract_retired",
     }
 
 

@@ -23,7 +23,7 @@ from pocketfinancer_sms.extractor import (
     build_extractor_input,
     parse_and_normalize_extraction,
 )
-from pocketfinancer_sms.processing_v3 import (
+from pocketfinancer_sms.processing import (
     CancellationToken,
     ExtractionCoordinator,
     RuntimeUnavailableError,
@@ -80,14 +80,13 @@ def _posted(source: str, *, amount: str = "INR 1,250.00", account: str = "XX1234
     )
 
 
-def _coordinator(model, *, catalog=(), rollout_mode="automatic") -> ExtractionCoordinator:
+def _coordinator(model, *, catalog=()) -> ExtractionCoordinator:
     return ExtractionCoordinator(
         _analyzer(),
         model,
         primary_currency="INR",
         enabled_profile_ids=("core-en", "india"),
         account_catalog=tuple(catalog),
-        rollout_mode=rollout_mode,
     )
 
 
@@ -210,10 +209,11 @@ def test_posted_mandatory_fields_are_required(missing: str, reason: str) -> None
 
 
 def test_none_settles_without_review_and_abstain_is_retained() -> None:
-    source = "This is a synthetic service notice."
+    source = "INR 500.00 balance available in account XX1234."
     none = _process(_coordinator(lambda _payload, _token: '{"decision":"none"}'), source)
     assert none.model_invoked is True
-    assert none.status == "not_posted"
+    assert none.status == "tombstoned_none"
+    assert none.body_retained is False
     assert none.review_case is None
 
     abstain = _process(_coordinator(lambda _payload, _token: '{"decision":"abstain"}'), source)
@@ -222,15 +222,31 @@ def test_none_settles_without_review_and_abstain_is_retained() -> None:
     assert abstain.reason_codes == ("extractor_abstained",)
 
 
-def test_all_valid_incoming_messages_invoke_even_when_legacy_triage_would_discard() -> None:
+def test_prefilter_excludes_otp_tombstone_while_disable_prefilter_allows_tombstoned_none() -> None:
     calls = []
 
     def model(payload, _token):
         calls.append(payload)
         return '{"decision":"none"}'
 
-    result = _process(_coordinator(model), "Your synthetic OTP is 123456.")
-    assert result.status == "not_posted"
+    excluded = _process(_coordinator(model), "Your synthetic OTP is 123456.")
+    assert excluded.status == "tombstoned_excluded"
+    assert excluded.model_invoked is False
+    assert excluded.body_retained is False
+    assert excluded.review_case is None
+    assert calls == []
+
+    bypass_coordinator = ExtractionCoordinator(
+        _analyzer(),
+        model,
+        primary_currency="INR",
+        enabled_profile_ids=("core-en", "india"),
+        apply_prefilter=False,
+    )
+    result = _process(bypass_coordinator, "Your synthetic OTP is 123456.")
+    assert result.status == "tombstoned_none"
+    assert result.model_invoked is True
+    assert result.body_retained is False
     assert len(calls) == 1
     assert calls[0]["message"] == "Your synthetic OTP is 123456."
 
@@ -240,7 +256,8 @@ def test_invalid_and_reliably_outgoing_inputs_bypass_the_model() -> None:
     coordinator = _coordinator(lambda *_args: calls.append(True) or '{"decision":"none"}')
     outgoing = _process(coordinator, "Synthetic outgoing message.", is_outgoing=True)
     invalid = _process(coordinator, "", input_valid=False)
-    assert outgoing.status == invalid.status == "bypassed"
+    assert outgoing.status == invalid.status == "tombstoned_excluded"
+    assert outgoing.body_retained is False and invalid.body_retained is False
     assert outgoing.reason_codes == ("reliable_outgoing_metadata",)
     assert invalid.reason_codes == ("invalid_input",)
     assert calls == []
@@ -263,25 +280,35 @@ def test_receipt_timestamp_is_authoritative_and_model_time_fields_are_rejected()
     assert outcome.received_timestamp_provenance == TimestampProvenance.PLATFORM_RECEIVED
 
 
-def test_offline_acquisition_time_cannot_claim_native_persistence_eligibility() -> None:
+def test_invalid_receipt_timestamp_provenance_blocks_automatic_persistence() -> None:
     source = "INR 1,250.00 was debited from account XX1234."
     catalog = (AccountCatalogEntry("acct-1", "bank_account", ("XX1234",)),)
-    outcome = _coordinator(lambda *_args: _posted(source), catalog=catalog).process(
+    historical = _coordinator(lambda *_args: _posted(source), catalog=catalog).process(
         source=source,
         raw_sender="AD-SYNTH1",
         operation_id="11111111-1111-4111-8111-111111111111",
         operation_config_hash=CONFIG_HASH,
         received_at_epoch_ms=RECEIVED_AT,
         received_timestamp_provenance=TimestampProvenance.ACQUISITION_SUPPLIED_MESSAGE_TIME,
+        source_event_key="synthetic-source-event-hist",
+        idempotency_key="synthetic-idempotency-hist",
+    )
+    assert historical.status == "eligible"
+
+    outcome = _coordinator(lambda *_args: _posted(source), catalog=catalog).process(
+        source=source,
+        raw_sender="AD-SYNTH1",
+        operation_id="11111111-1111-4111-8111-111111111111",
+        operation_config_hash=CONFIG_HASH,
+        received_at_epoch_ms=RECEIVED_AT,
+        received_timestamp_provenance=TimestampProvenance.ADMISSION_TIME,
         source_event_key="synthetic-source-event",
         idempotency_key="synthetic-idempotency",
     )
     assert outcome.status == "review"
     assert "persistence_receipt_timestamp_provenance_invalid" in outcome.reason_codes
     assert outcome.review_case is not None
-    assert outcome.review_case.to_dict()["receipt_timestamp"]["provenance"] == (
-        "acquisition_supplied_message_time"
-    )
+    assert outcome.review_case.to_dict()["receipt_timestamp"]["provenance"] == "admission_time"
 
 
 def test_no_wall_clock_deadline_is_supplied_to_runtime() -> None:
@@ -340,7 +367,7 @@ def test_runtime_truncation_is_retained_for_review() -> None:
     def truncated_runtime(_payload, _token):
         raise RuntimeTruncatedError
 
-    outcome = _process(_coordinator(truncated_runtime), "Synthetic service message.")
+    outcome = _process(_coordinator(truncated_runtime), "INR 100.00 notice for account XX1234.")
     assert outcome.status == "review"
     assert outcome.result is None
     assert outcome.reason_codes == ("runtime_output_truncated",)
@@ -360,7 +387,7 @@ def test_runtime_failures_are_retained_for_review(
     def failing_runtime(_payload, _token):
         raise error
 
-    outcome = _process(_coordinator(failing_runtime), "Synthetic service message.")
+    outcome = _process(_coordinator(failing_runtime), "INR 100.00 notice for account XX1234.")
     assert outcome.status == "review"
     assert outcome.result is None
     assert outcome.reason_codes == (reason,)
@@ -371,7 +398,7 @@ def test_process_interruption_is_resumable_and_retained() -> None:
     def interrupted_runtime(_payload, _token):
         raise KeyboardInterrupt
 
-    outcome = _process(_coordinator(interrupted_runtime), "Synthetic service message.")
+    outcome = _process(_coordinator(interrupted_runtime), "INR 100.00 notice for account XX1234.")
     assert outcome.status == "interrupted"
     assert outcome.result is None
     assert outcome.reason_codes == ("process_interrupted",)

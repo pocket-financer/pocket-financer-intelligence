@@ -1,4 +1,4 @@
-"""Schema, freeze-manifest, and sanitized-vector checks for extractor contracts."""
+"""Schema, manifest, and synthetic vector checks for unified SMS contracts."""
 
 from __future__ import annotations
 
@@ -12,39 +12,43 @@ import pytest
 
 from pocketfinancer_sms.account_resolution import AccountCatalogEntry
 from pocketfinancer_sms.analyzer import ANALYSIS_CONTRACT_V2, DeterministicSmsAnalyzer
-from pocketfinancer_sms.configuration import AssetBinding, ProcessingTrigger, RolloutMode
-from pocketfinancer_sms.configuration_v3 import ExtractorRuntimeConfig, ProcessingConfigSnapshotV3
+from pocketfinancer_sms.configuration import (
+    PIPELINE_CONTRACT,
+    AssetBinding,
+    ExtractorRuntimeConfig,
+    ProcessingConfigSnapshot,
+    ProcessingTrigger,
+    RolloutMode,
+    WireTransport,
+)
 from pocketfinancer_sms.currency import CurrencyContext
 from pocketfinancer_sms.extractor import (
+    APPLE_FLAT_FIELDS,
     ExtractionValidationError,
-    SourceSpan,
     build_extractor_input,
     parse_and_normalize_extraction,
+    project_apple_fm_flat_output,
 )
 from pocketfinancer_sms.feedback import (
     FieldRevisionProvenance,
     FieldRevisionV3,
     UserFeedbackEventV3,
 )
-from pocketfinancer_sms.processing_v3 import (
+from pocketfinancer_sms.processing import (
     ExtractionCoordinator,
     ReviewCase,
     ReviewUserRevision,
-    processing_result_payload_v3,
+    processing_result_payload,
 )
 from pocketfinancer_sms.provenance import file_sha256
 from pocketfinancer_sms.trace import ProcessingTraceV3, TraceEventV3
 from pocketfinancer_sms.types import TimestampProvenance
-from scripts.build_native_contract_release_v3 import (
-    build_manifest,
-    build_sanitized_vectors,
-    validate_freeze_inputs,
-)
 
 
 ROOT = Path(__file__).resolve().parents[2]
-CONTRACTS = ROOT / "configs" / "sms_processing" / "contracts"
-V3 = CONTRACTS / "v3"
+SMS_CONFIGS = ROOT / "configs" / "sms_processing"
+SCHEMAS = SMS_CONFIGS / "schemas"
+PROFILES = SMS_CONFIGS / "profiles"
 SHA = "a" * 64
 OPERATION_ID = "11111111-1111-4111-8111-111111111111"
 RECEIVED_AT = 1_700_000_000_000
@@ -55,7 +59,7 @@ def _json(path: Path) -> dict:
 
 
 def _schema(name: str) -> dict:
-    return _json(V3 / name)
+    return _json(SCHEMAS / name)
 
 
 def _analyzer() -> DeterministicSmsAnalyzer:
@@ -65,55 +69,26 @@ def _analyzer() -> DeterministicSmsAnalyzer:
     )
 
 
-def test_every_new_schema_is_valid_draft_2020_12() -> None:
-    schemas = (
-        "sms-extractor-input.schema.json",
-        "sms-extractor.schema.json",
-        "extractor-validation-profile.schema.json",
-        "processing-config.schema.json",
-        "processing-result.schema.json",
-        "processing-trace.schema.json",
-        "reason-code-registry.schema.json",
-        "account-resolution-profile.schema.json",
-        "review-case.schema.json",
-        "user-feedback.schema.json",
-        "canonical-label.schema.json",
-    )
-    for name in schemas:
+def test_every_active_schema_is_valid_draft_2020_12() -> None:
+    schema_files = tuple(sorted(path.name for path in SCHEMAS.glob("*.schema.json")))
+    assert len(schema_files) >= 12
+    for name in schema_files:
         jsonschema.Draft202012Validator.check_schema(_schema(name))
-    jsonschema.Draft202012Validator.check_schema(
-        _json(CONTRACTS / "releases" / "v3" / "release-manifest.schema.json")
-    )
 
 
-def test_profiles_and_reason_registry_are_schema_valid_and_codes_unique() -> None:
-    jsonschema.validate(
-        _json(V3 / "extractor-validation-profile.json"),
-        _schema("extractor-validation-profile.schema.json"),
-    )
-    jsonschema.validate(
-        _json(V3 / "account-resolution-profile.json"),
-        _schema("account-resolution-profile.schema.json"),
-    )
-    registry = _json(V3 / "reason-code-registry.json")
-    jsonschema.validate(registry, _schema("reason-code-registry.schema.json"))
+def test_profiles_and_reason_codes_are_complete_and_unique() -> None:
+    validation_profile = _json(PROFILES / "extractor-validation.json")
+    assert validation_profile["contract"] == "pocketfinancer.extractor-validation-profile/1"
+    account_profile = _json(PROFILES / "account-resolution.json")
+    assert account_profile["contract"] == "pocketfinancer.account-resolution-profile/1"
+    persistence_policy = _json(PROFILES / "persistence-policy.json")
+    assert persistence_policy["contract"] == "pocketfinancer.persistence-policy/1"
+    assert persistence_policy["duplicate_window_ms"] == 300_000
+    assert persistence_policy["retain_rejected_body"] is False
+
+    registry = _json(PROFILES / "reason-codes.json")
     codes = [item["code"] for namespace in registry["namespaces"] for item in namespace["codes"]]
     assert len(codes) == len(set(codes))
-    legacy_registry = _json(V3.parent / "v2" / "reason-code-registry.json")
-    legacy_by_code = {
-        item["code"]: item
-        for namespace in legacy_registry["namespaces"]
-        for item in namespace["codes"]
-    }
-    current_by_code = {
-        item["code"]: item for namespace in registry["namespaces"] for item in namespace["codes"]
-    }
-    assert legacy_by_code.keys() <= current_by_code.keys()
-    frozen_fields = ("meaning", "severity", "safety_relevant", "allowed_outcomes")
-    for code, legacy_item in legacy_by_code.items():
-        assert {field: current_by_code[code][field] for field in frozen_fields} == {
-            field: legacy_item[field] for field in frozen_fields
-        }
     required = {
         "extractor_malformed_json",
         "extractor_duplicate_json_key",
@@ -146,13 +121,9 @@ def test_profiles_and_reason_registry_are_schema_valid_and_codes_unique() -> Non
     assert required <= set(codes)
 
 
-def test_sanitized_goldens_are_grounded_and_parse_under_the_frozen_output_schema() -> None:
-    validate_freeze_inputs()
-    golden = _json(
-        ROOT / "tests" / "sms_processing" / "golden" / "extractor-v1" / "sanitized-vectors.json"
-    )
+def test_sanitized_goldens_are_grounded_and_parse_under_schema() -> None:
+    golden = _json(ROOT / "tests" / "sms_processing" / "golden" / "extractor-v1" / "sanitized-vectors.json")
     schema = _schema("sms-extractor.schema.json")
-    assert golden == build_sanitized_vectors()
     for case in golden["cases"]:
         jsonschema.validate(case["model_output"], schema)
         encoded = json.dumps(case["model_output"], ensure_ascii=False)
@@ -195,14 +166,14 @@ def test_executable_input_config_result_review_feedback_and_trace_match_schemas(
     )
     jsonschema.validate(request, _schema("sms-extractor-input.schema.json"))
 
-    config = ProcessingConfigSnapshotV3(
+    config = ProcessingConfigSnapshot(
         operation_id=OPERATION_ID,
         parent_operation_id=None,
         source_ref_hash="1" * 64,
         trigger=ProcessingTrigger.REALTIME,
         created_at_epoch_ms=RECEIVED_AT + 100,
         admission_epoch_ms=RECEIVED_AT,
-        release_id="native-integration-v3",
+        release_id=PIPELINE_CONTRACT,
         release_manifest_sha256="2" * 64,
         analyzer_behavior_version="pocketfinancer.structural-sms-analyzer/2",
         unicode_behavior_version="unicode-scalar-nfkc-casefold",
@@ -218,15 +189,17 @@ def test_executable_input_config_result_review_feedback_and_trace_match_schemas(
             ineligibility_reason=None,
             model_identifier="synthetic-local-model",
             model_file_sha256="9" * 64,
+            model_identity_kind="file_sha256",
             runtime_version="synthetic-runtime",
             os_version="synthetic-os",
             device_cohort="synthetic-device",
             prompt_sha256="6" * 64,
             grammar_sha256="7" * 64,
+            grammar_enabled=True,
+            wire_transport=WireTransport.DIRECT_JSON,
             validation_profile_sha256="8" * 64,
         ),
-        persistence_policy_version="pocketfinancer.persistence-policy/2",
-        rollout_mode=RolloutMode.SHADOW,
+        rollout_mode=RolloutMode.AUTOMATIC,
     )
     jsonschema.validate(config.to_dict(), _schema("processing-config.schema.json"))
 
@@ -235,31 +208,45 @@ def test_executable_input_config_result_review_feedback_and_trace_match_schemas(
         lambda _request, _token: '{"decision":"none"}',
         primary_currency="INR",
         enabled_profile_ids=("core-en", "india"),
-        rollout_mode="shadow",
     )
-    outcome = coordinator.process(
-        source="Synthetic service notice.",
+    excluded = coordinator.process(
+        source="Your synthetic OTP is 123456.",
         raw_sender="AD-SYNTH",
         operation_id=OPERATION_ID,
         operation_config_hash=SHA,
         received_at_epoch_ms=RECEIVED_AT,
         received_timestamp_provenance=TimestampProvenance.PLATFORM_RECEIVED,
-        source_event_key="synthetic-event",
-        idempotency_key="synthetic-idempotency",
+        source_event_key="synthetic-event-excl",
+        idempotency_key="synthetic-idempotency-excl",
     )
+    assert excluded.status == "tombstoned_excluded"
+    assert excluded.body_retained is False
     jsonschema.validate(
-        processing_result_payload_v3(outcome), _schema("processing-result.schema.json")
+        processing_result_payload(excluded), _schema("processing-result.schema.json")
     )
+
+    none_outcome = coordinator.process(
+        source="INR 42.50 available balance in account XX7788.",
+        raw_sender="AD-SYNTH",
+        operation_id=OPERATION_ID,
+        operation_config_hash=SHA,
+        received_at_epoch_ms=RECEIVED_AT,
+        received_timestamp_provenance=TimestampProvenance.PLATFORM_RECEIVED,
+        source_event_key="synthetic-event-none",
+        idempotency_key="synthetic-idempotency-none",
+    )
+    assert none_outcome.status == "tombstoned_none"
+    assert none_outcome.body_retained is False
+    jsonschema.validate(
+        processing_result_payload(none_outcome), _schema("processing-result.schema.json")
+    )
+
     posted_output = {
         "decision": "posted",
         "amount": {
             "value": "42.50",
             "currency": "INR",
-            "evidence": {
-                "start_scalar": 0,
-                "end_scalar": 9,
-                "text": "INR 42.50",
-            },
+            "evidence": {"start_scalar": 0, "end_scalar": 9, "text": "INR 42.50"},
         },
         "direction": {
             "value": "credit",
@@ -285,7 +272,6 @@ def test_executable_input_config_result_review_feedback_and_trace_match_schemas(
         primary_currency="INR",
         enabled_profile_ids=("core-en", "india"),
         account_catalog=(AccountCatalogEntry("opaque-account-1", "bank_account", ("XX7788",)),),
-        rollout_mode="automatic",
     )
     posted_outcome = posted_coordinator.process(
         source=source,
@@ -297,7 +283,7 @@ def test_executable_input_config_result_review_feedback_and_trace_match_schemas(
         source_event_key="synthetic-posted-event",
         idempotency_key="synthetic-posted-idempotency",
     )
-    posted_payload = processing_result_payload_v3(posted_outcome)
+    posted_payload = processing_result_payload(posted_outcome)
     assert posted_payload["status"] == "eligible"
     assert posted_payload["account_resolution"]["status"] == "uniquely_resolved"
     assert posted_payload["duplicate_assessment"]["status"] == "clear"
@@ -313,34 +299,7 @@ def test_executable_input_config_result_review_feedback_and_trace_match_schemas(
         primary_reason="extractor_abstained",
         reason_codes=("extractor_abstained",),
         furthest_stage="extractor_validation",
-        analyzer_suggestions=(
-            {
-                "kind": "amount",
-                "span": {
-                    "start_scalar": 0,
-                    "end_scalar": 9,
-                    "text": "INR 42.50",
-                },
-                "clause": source,
-                "suggested_interpretation": {"minor_units": 4250},
-                "provenance": {
-                    "candidate_id": "amt_synthetic",
-                    "analyzer_kind": "candidate",
-                },
-                "analyzer_version": "pocketfinancer.sms-analysis/2",
-            },
-            {
-                "kind": "credential",
-                "span": None,
-                "clause": None,
-                "suggested_interpretation": {"present": False},
-                "provenance": {
-                    "cue_id": "cue_synthetic",
-                    "analyzer_kind": "cue",
-                },
-                "analyzer_version": "pocketfinancer.sms-analysis/2",
-            },
-        ),
+        analyzer_suggestions=(),
         extractor_suggestion=None,
         account_resolution=None,
         user_revisions=(
@@ -361,59 +320,61 @@ def test_executable_input_config_result_review_feedback_and_trace_match_schemas(
         revision=2,
         previous_revision_hash="e" * 64,
     )
-    jsonschema.validate(
-        json.loads(json.dumps(review.to_dict())),
-        _schema("review-case.schema.json"),
-    )
+    jsonschema.validate(json.loads(json.dumps(review.to_dict())), _schema("review-case.schema.json"))
 
-    span = SourceSpan.from_source(source, source.index("credited"), source.index("credited") + 8)
-    revision = FieldRevisionV3(
-        "direction", "credit", FieldRevisionProvenance.USER_DIRECTION_CONTROL
-    )
-    feedback_review = ReviewCase(
-        review_case_id="synthetic-feedback-review",
-        operation_id_hash=hashlib.sha256(OPERATION_ID.encode()).hexdigest(),
-        raw_sender="AD-SYNTH",
-        source=source,
-        received_at_epoch_ms=RECEIVED_AT,
-        primary_reason="extractor_abstained",
-        reason_codes=("extractor_abstained",),
-        furthest_stage="extractor_validation",
-        analyzer_suggestions=(),
-        extractor_suggestion=None,
-        account_resolution=None,
-    )
     feedback = UserFeedbackEventV3.create(
         action_id="22222222-2222-4222-8222-222222222222",
         operation_id=OPERATION_ID,
-        review_case=feedback_review,
+        review_case=ReviewCase(
+            review_case_id="synthetic-feedback-review",
+            operation_id_hash=hashlib.sha256(OPERATION_ID.encode()).hexdigest(),
+            raw_sender="AD-SYNTH",
+            source=source,
+            received_at_epoch_ms=RECEIVED_AT,
+            primary_reason="extractor_abstained",
+            reason_codes=("extractor_abstained",),
+            furthest_stage="extractor_validation",
+            analyzer_suggestions=(),
+            extractor_suggestion=None,
+            account_resolution=None,
+        ),
         expected_review_revision=0,
         resulting_review_revision=1,
         action="correct",
         actor_id="synthetic-user",
-        field_revisions=(revision,),
+        field_revisions=(
+            FieldRevisionV3("direction", "credit", FieldRevisionProvenance.USER_DIRECTION_CONTROL),
+        ),
         created_at_epoch_ms=RECEIVED_AT,
     )
-    assert span.text == "credited"
     jsonschema.validate(feedback.to_dict(), _schema("user-feedback.schema.json"))
 
-    event = TraceEventV3(
-        sequence=0,
-        event_id="33333333-3333-4333-8333-333333333333",
-        occurred_at_epoch_ms=RECEIVED_AT,
-        stage="analysis_advisory",
-        status="completed",
-    )
     trace = ProcessingTraceV3.create(
         operation_id=OPERATION_ID,
         config_hash=SHA,
         owner_generation=1,
-        events=(event,),
+        events=(
+            TraceEventV3(
+                sequence=0,
+                event_id="33333333-3333-4333-8333-333333333333",
+                occurred_at_epoch_ms=RECEIVED_AT,
+                stage="prefilter",
+                status="completed",
+            ),
+        ),
     )
-    jsonschema.validate(
-        json.loads(json.dumps(asdict(trace))),
-        _schema("processing-trace.schema.json"),
+    jsonschema.validate(json.loads(json.dumps(asdict(trace))), _schema("processing-trace.schema.json"))
+
+
+def test_apple_flat_schema_matches_python_projection_fields() -> None:
+    flat_schema = _schema("apple-fm-flat.schema.json")
+    assert tuple(flat_schema["required"]) == APPLE_FLAT_FIELDS
+    assert tuple(flat_schema["properties"]) == APPLE_FLAT_FIELDS
+    projected = project_apple_fm_flat_output(
+        {key: ("none" if key == "decision" else ("" if not key.endswith(("_start", "_end")) else 0))
+         for key in APPLE_FLAT_FIELDS}
     )
+    jsonschema.validate(projected, _schema("sms-extractor.schema.json"))
 
 
 def test_canonical_label_v2_retains_taxonomy_and_requires_grounded_posted_fields() -> None:
@@ -458,29 +419,18 @@ def test_canonical_label_v2_retains_taxonomy_and_requires_grounded_posted_fields
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(payload, schema)
     payload["event"]["counterparty"] = None
-    payload["event"]["counterparty_span"] = span("credited")
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(payload, schema)
-    payload["event"]["counterparty_span"] = None
     del payload["event"]["direction_span"]
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(payload, schema)
 
 
-def test_manifest_rebuilds_exactly_and_preserves_every_legacy_hash() -> None:
-    stored = _json(CONTRACTS / "releases" / "native-integration-v3.json")
-    assert stored == build_manifest()
-    assert stored["automatic_persistence_enabled"] is False
-    jsonschema.validate(
-        stored,
-        _json(CONTRACTS / "releases" / "v3" / "release-manifest.schema.json"),
-    )
-    for artifact in stored["artifacts"]:
-        assert file_sha256(ROOT / artifact["path"]) == artifact["sha256"]
-
-    legacy = _json(CONTRACTS / "releases" / "native-integration-v2.json")
-    for artifact in legacy["artifacts"]:
-        assert file_sha256(ROOT / artifact["path"]) == artifact["sha256"]
+def test_release_manifest_validates_against_schema_and_file_hashes() -> None:
+    manifest = _json(SMS_CONFIGS / "release-manifest.json")
+    jsonschema.validate(manifest, _schema("release-manifest.schema.json"))
+    assert manifest["release_id"] == PIPELINE_CONTRACT
+    assert manifest["duplicate_window_ms"] == 300_000
+    for artifact in manifest["artifacts"]:
+        assert file_sha256(SMS_CONFIGS / artifact["path"]) == artifact["sha256"]
 
 
 def test_output_contract_rejects_time_fields_and_utf_offsets() -> None:
@@ -509,30 +459,3 @@ def test_output_contract_rejects_time_fields_and_utf_offsets() -> None:
     payload["account"]["evidence"]["start_utf16"] = 22
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(payload, schema)
-
-
-def test_actual_coordinator_review_includes_candidate_and_cue_advice() -> None:
-    source = "OTP 123456. INR 42.50 credited to account XX7788."
-    coordinator = ExtractionCoordinator(
-        _analyzer(),
-        lambda _request, _token: '{"decision":"abstain"}',
-        primary_currency="INR",
-        enabled_profile_ids=("core-en", "india"),
-        rollout_mode="shadow",
-    )
-    outcome = coordinator.process(
-        source=source,
-        raw_sender="AD-SYNTH",
-        operation_id=OPERATION_ID,
-        operation_config_hash=SHA,
-        received_at_epoch_ms=RECEIVED_AT,
-        received_timestamp_provenance=(TimestampProvenance.ACQUISITION_SUPPLIED_MESSAGE_TIME),
-        source_event_key="synthetic-review-event",
-        idempotency_key="synthetic-review-idempotency",
-    )
-    assert outcome.review_case is not None
-    payload = json.loads(json.dumps(outcome.review_case.to_dict()))
-    advice_kinds = {item["provenance"]["analyzer_kind"] for item in payload["analyzer_suggestions"]}
-    assert {"candidate", "cue"} <= advice_kinds
-    assert payload["receipt_timestamp"]["provenance"] == "acquisition_supplied_message_time"
-    jsonschema.validate(payload, _schema("review-case.schema.json"))

@@ -1,205 +1,197 @@
-"""Synthetic canonical-label, projection, trace, and feedback tests."""
+"""Synthetic canonical-label, trace, and feedback tests."""
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 
 import pytest
 
 from pocketfinancer_sms.analyzer import DeterministicSmsAnalyzer
 from pocketfinancer_sms.currency import CurrencyContext
-from pocketfinancer_sms.feedback import UserFeedbackEvent
+from pocketfinancer_sms.extractor import SourceSpan
+from pocketfinancer_sms.feedback import (
+    FieldRevisionProvenance,
+    FieldRevisionV3,
+    UserFeedbackEventV3,
+)
 from pocketfinancer_sms.labels import (
     CanonicalDecision,
-    CanonicalEvent,
-    CanonicalLabel,
+    CanonicalLabelV2,
     EventState,
+    ExtractorCanonicalEvent,
     LabelValidationError,
     OperationalClass,
-    PresenceState,
     ReviewStatus,
-    project_selector_target,
-    validate_canonical_label,
+    project_extractor_target,
+    validate_canonical_label_v2,
 )
-from pocketfinancer_sms.trace import ProcessingTrace, TraceStage
-from pocketfinancer_sms.types import CandidateKind, CurrencyProvenance, Direction, EvidenceSpan
+from pocketfinancer_sms.processing import ReviewCase
+from pocketfinancer_sms.trace import ProcessingTraceV3, TraceEventV3
+from pocketfinancer_sms.types import Direction
 
 
 def _posted_fixture():
     source = "INR 42.50 was credited to account **7788 from FRIEND."
-    analysis = DeterministicSmsAnalyzer(
-        CurrencyContext("INR", ("core-en", "india"))
-    ).analyze(source, operation_id="synthetic-label")
-    amount = analysis.candidates_of(CandidateKind.AMOUNT)[0]
-    direction = analysis.candidates_of(CandidateKind.DIRECTION)[0]
-    account = next(
-        item for item in analysis.candidates_of(CandidateKind.ACCOUNT) if not item.explicit_absence
-    )
-    counterparty = next(
-        item
-        for item in analysis.candidates_of(CandidateKind.COUNTERPARTY)
-        if not item.explicit_absence
-    )
-    assert amount.evidence and direction.evidence and account.evidence and counterparty.evidence
-    event = CanonicalEvent(
-        amount_span=amount.evidence,
+
+    def span(text: str) -> SourceSpan:
+        start = source.index(text)
+        return SourceSpan.from_source(source, start, start + len(text))
+
+    event = ExtractorCanonicalEvent(
+        amount_value="42.50",
         currency="INR",
-        currency_provenance=CurrencyProvenance.EXPLICIT_CODE,
+        amount_span=span("INR 42.50"),
         direction=Direction.CREDIT,
-        direction_span=direction.evidence,
-        account_state=PresenceState.PRESENT,
-        account_span=account.evidence,
-        counterparty_state=PresenceState.PRESENT,
-        counterparty_span=counterparty.evidence,
-        financial_family="bank_transfer",
-        payment_rail="bank_internal",
+        direction_span=span("credited"),
+        account_reference="**7788",
+        account_span=span("**7788"),
+        existing_account_id="acct-7788",
+        counterparty="FRIEND",
+        counterparty_span=span("FRIEND"),
     )
-    label = CanonicalLabel(
-        contract="pocketfinancer.canonical-label/1",
+    label = CanonicalLabelV2(
         label_id="synthetic-label-1",
         source_id="synthetic-source",
         revision=1,
         status=ReviewStatus.SUBMITTED,
-        decision=CanonicalDecision.POSTED,
+        decision="posted",
         operational_class=OperationalClass.POSTED_CANDIDATE,
         event_state=EventState.POSTED,
         financial_family="bank_transfer",
         payment_rail="bank_internal",
-        events=(event,),
+        event=event,
         uncertain=False,
         notes="",
         reviewer_id="synthetic-reviewer",
         created_at_epoch_ms=1_700_000_000_000,
     )
+    analysis = DeterministicSmsAnalyzer(
+        CurrencyContext("INR", ("core-en", "india"))
+    ).analyze(source, operation_id="synthetic-label")
     return source, analysis, label
 
 
-def test_valid_rich_label_projects_to_grounded_ids() -> None:
-    source, analysis, label = _posted_fixture()
-    validate_canonical_label(label, source)
-    target = project_selector_target(label, analysis, source)
+def test_valid_canonical_label_projects_to_extractor_target() -> None:
+    source, _analysis, label = _posted_fixture()
+    validate_canonical_label_v2(label, source)
+    target = project_extractor_target(label, source)
 
     assert target["decision"] == "posted"
-    assert target["amount"].startswith("amt_")
-    assert target["direction"].startswith("dir_")
-    assert target["account"].startswith("acc_")
-    assert target["counterparty"].startswith("cp_")
+    assert target["amount"]["value"] == "42.50"
+    assert target["amount"]["currency"] == "INR"
+    assert target["direction"]["value"] == "credit"
+    assert target["account"]["reference"] == "**7788"
+    assert target["counterparty"]["value"] == "FRIEND"
 
 
-def test_invalid_or_incomplete_label_never_becomes_negative_target() -> None:
-    source, analysis, label = _posted_fixture()
-    incomplete = CanonicalLabel(
-        **{
-            **{field: getattr(label, field) for field in label.__dataclass_fields__},
-            "events": (),
-        }
-    )
+def test_non_financial_outgoing_or_uncertain_posted_blocks_target_projection() -> None:
+    source, _analysis, label = _posted_fixture()
+    uncertain = replace(label, uncertain=True)
+    with pytest.raises(LabelValidationError, match="projection_uncertain"):
+        project_extractor_target(uncertain, source)
 
-    with pytest.raises(LabelValidationError, match="label_event_count_inconsistent"):
-        project_selector_target(incomplete, analysis, source)
-
-
-def test_unknown_optional_state_blocks_posted_projection() -> None:
-    source, analysis, label = _posted_fixture()
-    original = label.events[0]
-    unknown_event = CanonicalEvent(
-        amount_span=original.amount_span,
-        currency=original.currency,
-        currency_provenance=original.currency_provenance,
-        direction=original.direction,
-        direction_span=original.direction_span,
-        account_state=PresenceState.UNKNOWN,
-        account_span=None,
-        counterparty_state=original.counterparty_state,
-        counterparty_span=original.counterparty_span,
-        financial_family=original.financial_family,
-        payment_rail=original.payment_rail,
-    )
-    unknown = CanonicalLabel(
-        **{
-            **{field: getattr(label, field) for field in label.__dataclass_fields__},
-            "events": (unknown_event,),
-        }
-    )
-
-    with pytest.raises(LabelValidationError, match="projection_account_unknown"):
-        project_selector_target(unknown, analysis, source)
-
-
-def test_amount_evidence_must_contain_one_exact_money_value() -> None:
-    source, _analysis_value, label = _posted_fixture()
-    start = source.index("credited")
-    invalid_event = replace(
-        label.events[0],
-        amount_span=EvidenceSpan.from_source(source, start, start + len("credited")),
-    )
-
-    with pytest.raises(LabelValidationError, match="label_amount_evidence_not_exact_money"):
-        validate_canonical_label(replace(label, events=(invalid_event,)), source)
-
-
-def test_invalid_or_outgoing_truth_is_valid_but_never_becomes_selector_negative() -> None:
-    source, analysis, label = _posted_fixture()
     invalid_outgoing = replace(
         label,
-        decision=CanonicalDecision.NON_FINANCIAL,
+        decision="none",
         operational_class=OperationalClass.INVALID_OUTGOING,
         event_state=EventState.NO_EVENT,
         financial_family=None,
         payment_rail=None,
-        events=(),
+        event=None,
     )
-
-    validate_canonical_label(invalid_outgoing, source)
+    validate_canonical_label_v2(invalid_outgoing, source)
     with pytest.raises(LabelValidationError, match="projection_invalid_outgoing_excluded"):
-        project_selector_target(invalid_outgoing, analysis, source)
+        project_extractor_target(invalid_outgoing, source)
 
 
-def test_processing_trace_is_hash_bound_and_contains_truthful_stages() -> None:
-    trace = ProcessingTrace.create(
-        "synthetic-operation",
-        "a" * 64,
-        (
-            TraceStage(0, "analysis", "completed", ("amount_candidate_present",)),
-            TraceStage(1, "selector_decode", "completed", detail={"raw_output": "{synthetic}"}),
-        ),
+def test_amount_evidence_must_contain_exact_money_value() -> None:
+    source, _analysis, label = _posted_fixture()
+    assert label.event is not None
+    start = source.index("credited")
+    invalid_event = replace(
+        label.event,
+        amount_span=SourceSpan.from_source(source, start, start + len("credited")),
     )
+    with pytest.raises(LabelValidationError, match="label_extractor_event_invalid"):
+        validate_canonical_label_v2(replace(label, event=invalid_event), source)
 
+
+def test_canonical_decision_enum_remains_complete() -> None:
+    assert {item.value for item in CanonicalDecision} == {
+        "posted",
+        "not_posted",
+        "non_financial",
+        "ambiguous",
+        "multiple_event",
+    }
+
+
+def test_processing_trace_includes_prefilter_and_hash_chains() -> None:
+    first = TraceEventV3(
+        sequence=0,
+        event_id="11111111-1111-4111-8111-111111111111",
+        occurred_at_epoch_ms=1_700_000_000_000,
+        stage="prefilter",
+        status="completed",
+        reason_codes=("prefilter_eligible",),
+    )
+    second = TraceEventV3(
+        sequence=1,
+        event_id="22222222-2222-4222-8222-222222222222",
+        occurred_at_epoch_ms=1_700_000_000_100,
+        stage="analysis_advisory",
+        status="completed",
+        previous_event_hash=first.event_hash,
+    )
+    trace = ProcessingTraceV3.create(
+        operation_id="33333333-3333-4333-8333-333333333333",
+        config_hash="a" * 64,
+        owner_generation=1,
+        events=(first, second),
+    )
+    changed = ProcessingTraceV3.create(
+        operation_id="33333333-3333-4333-8333-333333333333",
+        config_hash="a" * 64,
+        owner_generation=1,
+        events=(first,),
+    )
     assert len(trace.trace_hash) == 64
-    changed = ProcessingTrace.create(
-        "synthetic-operation",
-        "a" * 64,
-        (TraceStage(0, "analysis", "completed", ("different",)),),
-    )
     assert trace.trace_hash != changed.trace_hash
 
 
-def test_feedback_is_append_only_provenance_and_correction_requires_label() -> None:
-    event = UserFeedbackEvent.create(
-        event_id="synthetic-feedback",
-        operation_id="synthetic-operation",
-        trace_hash="b" * 64,
-        revision=1,
-        action="correct",
-        canonical_label_id="synthetic-label-1",
-        canonical_label_revision=1,
-        created_at_epoch_ms=1_700_000_000_000,
-        actor_id="synthetic-user",
+def test_feedback_is_hash_chained_and_validates_spans() -> None:
+    source, _analysis, _label = _posted_fixture()
+    review = ReviewCase(
+        review_case_id="synthetic-review",
+        operation_id_hash=hashlib.sha256(
+            "33333333-3333-4333-8333-333333333333".encode()
+        ).hexdigest(),
+        raw_sender="SYNTH-BANK",
+        source=source,
+        received_at_epoch_ms=1_700_000_000_000,
+        primary_reason="extractor_abstained",
+        reason_codes=("extractor_abstained",),
+        furthest_stage="extractor_validation",
+        analyzer_suggestions=(),
+        extractor_suggestion=None,
+        account_resolution=None,
     )
-    assert event.action == "correct"
-    assert len(event.operation_id_hash) == 64
-
-    with pytest.raises(ValueError, match="correct feedback requires"):
-        UserFeedbackEvent.create(
-            event_id="synthetic-feedback-2",
-            operation_id="synthetic-operation",
-            trace_hash="b" * 64,
-            revision=2,
-            action="correct",
-            canonical_label_id=None,
-            canonical_label_revision=None,
-            created_at_epoch_ms=1_700_000_000_001,
-            actor_id="synthetic-user",
-            previous_event_hash="c" * 64,
-        )
+    event = UserFeedbackEventV3.create(
+        action_id="44444444-4444-4444-8444-444444444444",
+        operation_id="33333333-3333-4333-8333-333333333333",
+        review_case=review,
+        expected_review_revision=0,
+        resulting_review_revision=1,
+        action="correct",
+        actor_id="synthetic-reviewer",
+        field_revisions=(
+            FieldRevisionV3(
+                "direction",
+                "credit",
+                FieldRevisionProvenance.USER_DIRECTION_CONTROL,
+            ),
+        ),
+        created_at_epoch_ms=1_700_000_000_500,
+    )
     assert len(event.event_hash) == 64

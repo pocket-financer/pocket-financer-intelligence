@@ -1,9 +1,4 @@
-"""Strict, source-grounded direct SMS extraction.
-
-This module is deliberately separate from :mod:`selector`. The historical
-candidate protocol remains readable while new operations use source spans and
-host-owned normalization.
-"""
+"""Strict, source-grounded direct SMS extraction."""
 
 from __future__ import annotations
 
@@ -11,6 +6,7 @@ import hashlib
 import json
 import re
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -565,6 +561,84 @@ def _normalize_money(evidence: str, declared_value: str, currency: str) -> int:
     return grounded.minor_units
 
 
+APPLE_FLAT_FIELDS = (
+    "decision",
+    "amount_value",
+    "amount_currency",
+    "amount_start",
+    "amount_end",
+    "amount_text",
+    "direction_value",
+    "direction_start",
+    "direction_end",
+    "direction_text",
+    "account_reference",
+    "account_start",
+    "account_end",
+    "account_text",
+    "counterparty_value",
+    "counterparty_start",
+    "counterparty_end",
+    "counterparty_text",
+)
+_APPLE_FLAT_STRING_FIELDS = frozenset(
+    key for key in APPLE_FLAT_FIELDS if not key.endswith(("_start", "_end"))
+)
+
+
+def project_apple_fm_flat_output(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Project an Apple Foundation Models flat guided response into extractor JSON."""
+
+    if not isinstance(value, Mapping) or set(value) != set(APPLE_FLAT_FIELDS):
+        raise ValueError("Apple guided response fields are invalid")
+    for key in APPLE_FLAT_FIELDS:
+        item = value[key]
+        if key in _APPLE_FLAT_STRING_FIELDS:
+            if not isinstance(item, str):
+                raise ValueError("Apple guided response field type is invalid")
+        elif isinstance(item, bool) or not isinstance(item, int):
+            raise ValueError("Apple guided response offset type is invalid")
+    decision = value["decision"]
+    if decision not in {"none", "abstain", "posted"}:
+        raise ValueError("Apple guided response decision is invalid")
+    if decision != "posted":
+        if any(
+            value[key] != ("" if key in _APPLE_FLAT_STRING_FIELDS else 0)
+            for key in APPLE_FLAT_FIELDS[1:]
+        ):
+            raise ValueError("Apple non-posted response has extraction fields")
+        return {"decision": decision}
+
+    def evidence(prefix: str) -> dict[str, Any]:
+        return {
+            "start_scalar": value[f"{prefix}_start"],
+            "end_scalar": value[f"{prefix}_end"],
+            "text": value[f"{prefix}_text"],
+        }
+
+    counterparty_empty = (
+        value["counterparty_value"] == ""
+        and value["counterparty_text"] == ""
+        and value["counterparty_start"] == 0
+        and value["counterparty_end"] == 0
+    )
+    return {
+        "decision": "posted",
+        "amount": {
+            "value": value["amount_value"],
+            "currency": value["amount_currency"],
+            "evidence": evidence("amount"),
+        },
+        "direction": {"value": value["direction_value"], "evidence": evidence("direction")},
+        "account": {"reference": value["account_reference"], "evidence": evidence("account")},
+        "counterparty": (
+            None
+            if counterparty_empty
+            else {"value": value["counterparty_value"], "evidence": evidence("counterparty")}
+        ),
+    }
+
+
 def _direction_is_grounded(direction: Direction, evidence: str) -> bool:
     normalized = unicodedata.normalize("NFKC", evidence).casefold()
     terms = {
@@ -576,7 +650,32 @@ def _direction_is_grounded(direction: Direction, evidence: str) -> bool:
             "spent",
             "paid",
             "charged",
+            "sent",
+            "txn",
+            "transaction",
+            "payment",
+            "transfer",
+            "transferred",
+            "purchase",
+            "purchased",
+            "autopaid",
+            "without otp",
+            "dr",
+            "used",
         ),
-        Direction.CREDIT: ("credit", "credited", "deposited", "received", "refunded"),
+        Direction.CREDIT: (
+            "credit",
+            "credited",
+            "deposited",
+            "deposit",
+            "received",
+            "refunded",
+            "refund",
+            "reversed",
+            "reversal",
+            "cr",
+            "cashback",
+            "adjusted",
+        ),
     }
     return any(re.search(rf"\b{re.escape(term)}\b", normalized) for term in terms[direction])

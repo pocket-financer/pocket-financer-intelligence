@@ -1,60 +1,43 @@
-# Documentation map
+# Documentation Map
 
-This repository owns PocketFinancer's shared SMS architecture, frozen contracts,
-sanitized parity fixtures, evaluation definitions, private local workbench, and
-historical model evidence. The host GGUF evaluator and encrypted native-trace
-import exist; the dedicated Android and iOS native evaluation lanes are planned.
-Native implementation details live in the Android and iOS repositories.
+`pocket-financer-intelligence` owns PocketFinancer's shared SMS processing
+contracts, Python reference pipeline, evaluation harness, encrypted local
+annotation workbench, and cross-platform asset sync. Native app implementations
+live in sibling repositories (`pocket-financer-android` and
+`pocket-financer-ios`).
 
-## Canonical documents
+## Core documents
 
-Read these in order:
+Read in order:
 
-1. [SMS processing architecture](architecture/SMS_PROCESSING_ARCHITECTURE.md) —
-   current responsibilities, routing boundary, transparency, compatibility, and
-   operating model.
-2. [Cross-platform roadmap](plans/CROSS_PLATFORM_SMS_ROADMAP.md) — the one active
-   implementation sequence and acceptance checkpoints.
-3. [SMS evaluation strategy](plans/SMS_EVALUATION_STRATEGY.md) — contract parity,
-   product quality, runtime, recovery, and device evidence.
-4. [Direct SMS extractor contract](contracts/DIRECT_SMS_EXTRACTOR_CONTRACT.md) —
-   model/host boundary, Unicode scalar grounding, exact money, and review rules.
-5. [Native SMS integration contract](contracts/NATIVE_SMS_INTEGRATION_CONTRACT.md) —
-   frozen release compatibility and model-identity provenance.
-6. [SMS processing decision log](architecture/SMS_PROCESSING_DECISION_LOG.md) —
-   dated decisions and rejected alternatives.
-7. [Currency context and provenance](architecture/CURRENCY_CONTEXT_AND_PROVENANCE.md),
-   [data taxonomy](architecture/DATA_TAXONOMY_AND_CANONICAL_LABELS.md), and
-   [workbench flow](architecture/WORKBENCH_REQUIREMENTS_AND_DATA_FLOW.md).
+1. [Architecture](ARCHITECTURE.md) — unified `pocketfinancer.sms-pipeline/1`
+   architecture, deterministic safety boundaries, cross-platform asset sync,
+   and clean future model-agnostic fine-tuning path (`CanonicalLabelV2` ->
+   `project_extractor_target`).
+2. [Evaluation](EVALUATION.md) — `android_target_gguf`, `apple_fm_python`, and
+   stateful mechanics evaluation lanes, cohort boundaries, and metrics.
+3. [Workbench](WORKBENCH.md) — canonical corpus construction, blind-pool
+   isolation, encrypted SQLCipher `workbench-v2.sqlite3`, loopback UI, and
+   `CanonicalLabelV2` revision/export flow.
+4. [WSL and local setup](WSL_AND_LOCAL_SETUP.md) — WSL Ubuntu `.venv` workflow,
+   native WSL2 `ext4` CUDA environment, CI parity checks, and macOS Apple FM
+   notes.
 
-## Platform handoffs
+## Repository governance & command references
 
-Each native repository has one concise next-step document:
+- [Repository overview](../README.md)
+- [Agent instructions & privacy rules](../AGENTS.md)
+- [Contribution workflow](../CONTRIBUTING.md)
+- [Scripts & CLI command map](../scripts/README.md)
+- [Release manifest](../configs/sms_processing/release-manifest.json)
 
-- Android: `docs/sms-processing-next-steps.md` in `pocket-financer-android`.
-- iOS: `docs/sms-processing-next-steps.md` in `pocket-financer-ios`.
+## Status vocabulary
 
-The shared repository is operated from WSL, Android from Windows/Gradle and the
-Android emulator/device lane, and iOS from macOS/Xcode and the simulator/iPhone
-lane. Evidence is not transferable between lanes.
-
-## Historical evidence
-
-Use the [historical evidence index](history/SMS_PROCESSING_EVIDENCE_INDEX.md) for
-dated implementation evidence, model reports, and compatibility artifacts.
-Historical reports remain accurate only for the contract and runtime they
-measured. The 203-row fixture is a repeatedly consulted regression set, not fresh
-human gold.
-
-## Status language
-
-- **Implemented** means source exists and the stated local checks ran in the named
-  lane; it does not imply device acceptance.
-- **Planned** means the behavior requires code and usually an additive contract.
-- **Historical** means preserved evidence under an older state or contract.
-- **Unverified** means the required host, simulator, emulator, or physical device
-  was not exercised.
-
-Raw SMS, identifiers, private predictions, local databases, adapters, and model
-weights remain ignored and local. Nothing in these documents authorizes upload,
-publication, deployment, or automatic persistence.
+- **Implemented**: Code, schemas, and automated checks exist in this repository
+  and pass in the stated verification lane.
+- **Planned**: Designed contract or downstream work not yet implemented or not
+  yet trained (such as future model-agnostic fine-tuning on `CanonicalLabelV2`).
+- **Grandfathered**: Preserved regression fixture (`DATA/extraction_ds.jsonl`,
+  203 rows) retained solely for non-production regression checks.
+- **Unverified**: A runtime lane (for example physical Android/iOS device or
+  Apple Silicon `apple-fm-sdk`) was not executed in the current check run.
