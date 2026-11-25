@@ -1,140 +1,110 @@
 # Repository Development Instructions
 
-This is the canonical repository guidance for humans and automated development
-tools. It is intentionally independent of any editor, coding agent, or model
-provider. Read this file before changing code, data builders, evaluation behavior,
-or experiment documentation.
+This is the canonical guidance for humans and coding agents working in
+`pocket-financer-intelligence`. Read this file before modifying code, schemas,
+evaluation runners, workbench tools, or documentation.
 
-## Authority and source of truth
+## Authority and scope
 
-PocketFinancer Android defines the product behavior. The current locked profile is
-`configs/contracts/pocketfinancer-android-current.json`; its pinned Android commit,
-prompt assets, filter, runtime settings, and parser semantics must agree with
-`lfm25/android_contract.py`.
+1. Executable Python code in `src/pocketfinancer_sms/`, schemas and profiles in
+   `configs/sms_processing/`, and conformance vectors in
+   `tests/sms_processing/golden/` are the authoritative specification. Prose
+   must follow executable code and schemas.
+2. `pocket-financer-intelligence` owns the shared contracts, Python reference
+   pipeline, corpus builder, encrypted annotation workbench, and Python
+   evaluators.
+3. Do not modify sibling repositories (`pocket-financer-android` or
+   `pocket-financer-ios`) from intelligence-scoped tasks; propagate shared
+   assets explicitly with `scripts/sync_native_assets.py`.
 
-Use this precedence when sources disagree:
+## Working environment (WSL Ubuntu)
 
-1. Committed PocketFinancer Android source at the profile's pinned revision.
-2. Executable code, tests, pipeline declarations, and immutable lock files here.
-3. The experiment catalog and dated run reports.
-4. General architecture guides and historical notes.
+- The shared WSL Ubuntu Python 3.11 environment lives at
+  `/home/tojinotzenin/pF_slm_selection/.venv/bin/python`.
+- Run repo safety checks, manifest checks, Ruff, ShellCheck, pytest, and
+  aggregate prefilter/corpus checks from WSL against
+  `/mnt/d/Personal_Projects/pocket-financer/pocket-financer-intelligence`:
+  ```bash
+  /home/tojinotzenin/pF_slm_selection/.venv/bin/python scripts/check_repo_safety.py
+  /home/tojinotzenin/pF_slm_selection/.venv/bin/python scripts/sync_native_assets.py --check --manifest-only
+  /home/tojinotzenin/pF_slm_selection/.venv/bin/python -m ruff check .
+  /home/tojinotzenin/pF_slm_selection/.venv/bin/python -m ruff check --select E4,E7,E9,F src scripts tests
+  /home/tojinotzenin/pF_slm_selection/.venv/bin/python -m pytest -q
+  ```
+- CUDA/PyTorch/GGUF runtime scripts (`scripts/setup_wsl.sh`,
+  `scripts/activate_wsl.sh`, `scripts/evaluate.sh`, `scripts/fetch_models.sh`)
+  require a native WSL2 `ext4` checkout (such as `/home/tojinotzenin/pF_slm_selection`)
+  and intentionally fail closed under `/mnt/*`, Docker, WSL1, or non-Linux hosts.
+- Apple Foundation Models live inference (`evaluate-apple-fm`) runs only on
+  compatible macOS Apple Silicon hosts (`apple-fm-sdk`); non-macOS hosts run
+  fake-provider unit tests only.
+- Enforce Unix `LF` line endings across all text files and shell scripts
+  (`.editorconfig` and `.gitattributes`). Run `git add --renormalize .` before
+  committing when working across Windows and WSL.
 
-Verify prose against current code before relying on it. Do not silently update the
-profile to match a different Android checkout; audit the app change and version the
-contract deliberately.
+## Strict privacy and data-handling rules
 
-## Project boundary
+The following files and roots are strictly local and must NEVER be committed,
+read into prompts/logs, or modified casually:
 
-The supported app-facing workflow is declared in
-`configs/pipelines/pocketfinancer-lfm2.5-350m.json` and orchestrated by
-`scripts/run_pocketfinancer_pipeline.py`. Its stages are data build, LoRA training,
-HF diagnostics, merge, GGUF conversion, and Android-profile GGUF evaluation.
+- `all_sms.json`, `all_sms.csv`, `sms.db`
+- `PRIVATE_DATA/` (including `PRIVATE_DATA/sms_processing/` and WSL
+  `/home/tojinotzenin/pF_slm_selection/PRIVATE_DATA/`)
+- `MODELS/` (including WSL `/home/tojinotzenin/pF_slm_selection/MODELS/`)
+- `RESULTS/`, `TRAINING_ARTIFACTS/`, `PUBLIC_CANDIDATE/`, `UPSTREAM/`
 
-The broad GGUF slate and older short-prompt experiments remain historical tools.
-They must not be presented as current Android-runtime evidence. Keep reusable
-logic model-agnostic: model identity, thinking behavior, quantization, and limits
-belong in configuration or versioned profiles rather than hidden conditionals.
+Rules that apply at all times:
 
-`lm-evaluation-harness/` and `UPSTREAM/` are external source trees. Prefer
-out-of-tree extensions and do not edit vendored/upstream code unless the task
-specifically requires it and the corresponding lock/provenance record is updated.
+1. Never print, log, quote, or inspect raw SMS bodies, sender IDs, phone
+   numbers, account digits, notes, or per-row predictions from `all_sms.json`,
+   `sms.db`, or `PRIVATE_DATA/` in terminal output, code, tests, docs, or PRs.
+2. Aggregate counts and hashes only: when verifying corpus regressions (such as
+   prefilter pass/exclude counts on `all_sms.json`), print integer totals and
+   reason counts only—never message content or examples.
+3. Never send private messages or identifiers to hosted APIs, telemetry, cloud
+   inference, or remote experiment trackers.
+4. All test fixtures, golden vectors, examples, and documentation must use 100%
+   invented synthetic data.
+5. `DATA/extraction_ds.jsonl` is a grandfathered 203-row regression fixture
+   only. Never train on it or present it as a fresh test or production claim.
+6. Local corpus, workbench, and evaluation commands never authorize publishing
+   data, weights, or application builds.
 
-## Working environment
+## Engineering & future fine-tuning rules
 
-The canonical checkout is the native WSL2 repository:
+- Keep pipeline, evaluation, and future fine-tuning logic strictly
+  model-agnostic: model IDs, chat templates, quantization, and runtime limits
+  belong in configuration rather than model-specific code sprawl.
+- Legacy LFM2.5 fine-tuning, LoRA probe, and candidate-selector modules have
+  been retired and removed. Any future fine-tuning pipeline must build cleanly
+  from scratch on top of the annotated SQLCipher workbench corpus using
+  `CanonicalLabelV2` -> `project_extractor_target(...)` (committed `submitted`
+  or `adjudicated` labels, excluding `uncertain=True` and `invalid_outgoing`),
+  strictly preserving template-component-disjoint pool isolation.
+- Never silently weaken privacy guards, schema validation, Unicode-scalar
+  grounding checks, 64-bit integer money bounds, or deterministic safety gates.
+- Keep `configs/sms_processing/release-manifest.json` synchronized with
+  `scripts/sync_native_assets.py --manifest-only` whenever any prompt, grammar,
+  profile, or schema under `configs/sms_processing/` changes.
 
-```text
-/home/tojinotzenin/pF_slm_selection
-```
+## Required checks before committing
 
-Run Python, Git, CUDA training, conversion, and tests inside Ubuntu. The Windows
-checkout is not a development mirror. Activate the prepared environment with
-`source scripts/activate_wsl.sh`.
-
-There are three verification tiers:
-
-1. Lightweight CI: safety, Ruff, ShellCheck, and unit tests without Torch/model
-   downloads.
-2. Local ML: CUDA/backward probes, data materialization, training, and HF checks.
-3. Runtime/device: GGUF parity checks and Android phone measurements.
-
-Do not turn a higher tier into a prerequisite for documentation or pure unit work.
-Never describe HF timing as GGUF timing or desktop host timing as phone timing.
-
-## End-to-end change discipline
-
-Trace every material change across its full path: Android source/profile, prompt
-serialization, prefilter, dataset construction, labels and split policy, training
-objective, checkpoint selection, merge, conversion, quantization, evaluator,
-parser, metrics, reports, and deployment gate.
-
-For long-running or resumable work, define behavior for fresh runs, existing
-outputs, interruption, retry, partial artifacts, and provenance mismatch. Prefer
-stage-by-stage execution. Never overwrite a nonempty training run implicitly or
-reuse cached results whose hashes/configuration no longer match.
-
-Keep experiment comparisons controlled. Record model revision, contract and data
-hashes, seed, loss/training settings, selected checkpoint, decode settings,
-quantization, evaluator hash, and runtime-parity limitations. Change one class of
-variable at a time or label the comparison non-causal.
-
-Add tests at the lowest practical layer, then run the relevant integration guard.
-Update the experiment catalog when a result's trust status changes. Preserve
-historical reports; add a clear supersession banner instead of rewriting old runs
-as though they used a newer contract.
-
-## Data, privacy, and publication
-
-The following roots contain local or generated material and must remain ignored:
-
-```text
-PRIVATE_DATA/       raw-derived datasets, review queues, split manifests
-PUBLIC_CANDIDATE/   unreleased dataset candidates
-MODELS/             downloaded model/tokenizer/GGUF assets
-TRAINING_ARTIFACTS/ adapters, checkpoints, merged weights, conversion outputs
-RESULTS/            aggregate and per-row predictions/benchmarks
-UPSTREAM/           locally pinned external source trees
-```
-
-Do not print or commit raw SMS, senders, identifiers, per-row private predictions,
-stable source mappings, credentials, or model weights. Do not send private data to
-hosted APIs, telemetry, W&B, remote labeling, or cloud inference. Synthetic test
-fixtures must not be copied from private rows.
-
-`DATA/extraction_ds.jsonl` is a grandfathered, repeatedly consulted 203-row
-regression fixture. Never train on it or call it a fresh test. Production claims
-require a newly adjudicated, template/sender-held-out human-gold test.
-
-Dataset preparation and local model work do not authorize upload, publication,
-release, or deployment. Those actions require an explicit user decision after
-privacy, data-rights, model-license, and target-device review.
-
-## Required checks
-
-From the activated WSL environment, the normal code/documentation gate is:
+Run all checks in WSL and verify clean git status:
 
 ```bash
 python scripts/check_repo_safety.py
-ruff check .
-ruff check --select E4,E7,E9,F lfm25 scripts tests
-pytest -q
+python scripts/sync_native_assets.py --check --manifest-only
+python -m ruff check .
+python -m ruff check --select E4,E7,E9,F src scripts tests
+shellcheck --external-sources --exclude=SC1090,SC1091,SC2086,SC2162,SC2317 -- $(git ls-files '*.sh')
+python -m pytest -q
 git diff --check
 ```
 
-Run `python scripts/run_pocketfinancer_pipeline.py check` when changing the app
-profile, locks, pipeline config, or stage orchestration. Run targeted CUDA,
-conversion, GGUF, and device checks only when the affected layer requires them;
-report exactly which tier was and was not verified.
+## Version control
 
-## Version control and pull requests
-
-Use a short-lived branch and a focused pull request. Do not push development work
-directly to `main`. Use a Conventional Commit title such as `feat:`, `fix:`,
-`docs:`, `test:`, `refactor:`, `build:`, `ci:`, or `chore:`. Preserve unrelated
-worktree changes and never weaken tests, privacy guards, or provenance checks to
-make a change pass.
-
-The pull request must state the engineering outcome, app/experiment impact,
-verification commands and results, privacy/reproducibility considerations, and
-known runtime-parity gaps. Create and update the pull request when credentials and
-authorization permit; otherwise report the exact external blocker.
+- Work on short-lived feature/consolidation branches (never commit or push
+  directly to `main`).
+- Use Conventional Commit subjects (`feat:`, `fix:`, `docs:`, `test:`, `ci:`,
+  `refactor:`, `chore:`).
+- Never bypass failing safety, lint, manifest, ShellCheck, or unit tests.

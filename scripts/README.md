@@ -1,181 +1,86 @@
-# Command map
+# Scripts and Command Map
 
-Run commands inside WSL2 after activating the environment from the canonical
-checkout with `source /home/tojinotzenin/pF_slm_selection/scripts/activate_wsl.sh`.
-Then enter the checkout that owns the code. Keep linked worktrees outside the
-canonical repository and generated-artifact roots, and use only synthetic data
-there. The privacy guard intentionally rejects private roots that resolve outside
-the active checkout. Run private workflows from the canonical checkout after the
-change is merged; never symlink or copy `PRIVATE_DATA` into a worktree.
+## Active SMS processing and workbench CLI
 
-## Primary PocketFinancer pipeline
-
-`scripts/run_pocketfinancer_pipeline.py` is the single supported entry point for
-new app-facing work. The default and canonical declaration is
-`configs/pipelines/pocketfinancer-lfm2.5-350m.json`. The parallel
-`configs/pipelines/pocketfinancer-lfm2.5-2.6b-base.json` declaration applies the
-same workflow to the pinned LFM2.5-2.6B-Base checkpoint and must be selected
-explicitly with `--config`. Both declarations expose these stages:
-
-| Stage | Purpose |
-|---|---|
-| `check` | Report local readiness and exact inputs without modifying anything |
-| `plan` | Print every command as an argv array |
-| `build-data` | Materialize app-filtered, source-grounded private train/dev rows |
-| `evaluate-base-hf` | Evaluate the locked, untuned HF checkpoint before adaptation |
-| `train` | Train completion-only LoRA with the exact PocketFinancer messages |
-| `evaluate-hf` | Evaluate the trained HF adapter using the app prompt and prefilter |
-| `merge` | Merge the chosen adapter into the HF base |
-| `convert` | Produce reference and deployable GGUF files |
-| `evaluate-gguf` | Evaluate the deployable artifact under the app runtime profile |
-
-Execution order is `build-data`, `evaluate-base-hf`, `train`, `evaluate-hf`,
-`merge`, `convert`, then `evaluate-gguf`. Use `--dry-run` with an execution stage
-to inspect only that command. `all` exists for an intentional end-to-end run, but
-stage-by-stage execution is preferable while developing because each artifact can
-be inspected before the next expensive step.
-
-When thinking mode is enabled, the HF and GGUF evaluators retain raw reasoning
-only in `samples.jsonl` beneath ignored local `RESULTS/` directories; aggregate
-metrics do not contain it. Evaluation timing is measured on the WSL host, not on
-an Android device, and is not Android runtime-performance evidence.
-
-## Environment and safety
+`scripts/run_sms_processing.py` is the single CLI entry point for
+`pocketfinancer_sms`. Every command prints aggregate-safe JSON only and keeps
+private artifacts inside ignored `PRIVATE_DATA/sms_processing/`.
 
 | Command | Purpose |
 |---|---|
-| `python scripts/verify_gpu.py` | Verify CUDA/PyTorch and local runtime readiness |
-| `python scripts/verify_lfm25_backward.py` | Run a real short LFM backward-pass probe |
-| `python scripts/probe_lfm25_lora_memory.py --help` | Inspect the one-backward-pass LoRA capacity gate; it is not training or quality evidence |
-| `python scripts/check_repo_safety.py` | Check that private/generated artifacts cannot be committed |
-| `bash scripts/setup_wsl.sh` | Bootstrap the pinned native WSL environment |
+| `python scripts/run_sms_processing.py build-corpus` | Build or reuse the immutable canonical corpus run from `configs/sms_processing/profiles/archive-india-inr.json` |
+| `python scripts/run_sms_processing.py prefilter --text "<sms>"` | Run `sms-prefilter/1` on a single string (or stdin) and print `{"decision","reason"}` |
+| `python scripts/run_sms_processing.py init-workbench` | Import the `CURRENT.json` canonical manifest into encrypted SQLCipher `workbench-v2.sqlite3` |
+| `python scripts/run_sms_processing.py serve-workbench [--port 8765]` | Serve the token-authenticated local workbench on `127.0.0.1` only |
+| `python scripts/run_sms_processing.py backup-workbench` | Create and integrity-verify a mode-`0600` encrypted SQLCipher backup + `.manifest.json` |
+| `python scripts/run_sms_processing.py export-workbench --selection-manifest <path> --consent-local-encrypted-export` | Export selected hash-bound submitted/adjudicated revisions inside `PRIVATE_DATA/sms_processing/` |
+| `python scripts/run_sms_processing.py migrate-secure-workbench` | Migrate a legacy plaintext `workbench.sqlite3` to SQLCipher `workbench-v2.sqlite3` with encrypted recovery |
+| `python scripts/run_sms_processing.py import-native-trace --bundle <path> [--key-id native-trace-import-v1]` | Import an AES-GCM encrypted Android or iOS trace bundle while rejecting blind-pool matches |
+| `python scripts/run_sms_processing.py evaluate-extractor --gguf <local.gguf> --suite {synthetic,grandfathered,private-canonical} --output-dir PRIVATE_DATA/sms_processing/evaluations/<run>` | Evaluate the direct extractor (`android_target_gguf`) using GGUF + embedded chat template + optional GBNF |
+| `python scripts/run_sms_processing.py evaluate-apple-fm --suite {synthetic,grandfathered,private-canonical} --output-dir PRIVATE_DATA/sms_processing/evaluations/<run>` | Evaluate the Apple Foundation Models guided flat lane (`apple_fm_python`) on compatible macOS |
+| `python scripts/run_sms_processing.py sync-native-assets [--manifest-only] [--check]` | Wrapper around `scripts/sync_native_assets.py` |
 
-## Current data builders
+## Contract manifest and native asset sync
+
+`scripts/sync_native_assets.py` builds
+`configs/sms_processing/release-manifest.json` with SHA-256 checksums across all
+shared contracts, prompts, grammar, schemas, and profiles, and copies/verifies
+them into sibling native repositories:
+
+```bash
+# Regenerate release-manifest.json after editing configs/sms_processing/
+python scripts/sync_native_assets.py --manifest-only
+
+# Verify release-manifest.json matches configs/sms_processing/ (CI check)
+python scripts/sync_native_assets.py --check --manifest-only
+
+# Sync assets + tests/sms_processing/golden/prefilter-vectors.json to Android or iOS
+python scripts/sync_native_assets.py --target android
+python scripts/sync_native_assets.py --target ios
+python scripts/sync_native_assets.py --check
+```
+
+## Environment, GPU, and repository safety
+
+| Script | Purpose |
+|---|---|
+| `python scripts/check_repo_safety.py` | Inspect `git ls-files -z` pathnames (without reading contents) and reject private/model/result artifacts |
+| `bash scripts/setup_wsl.sh` | Bootstrap `.venv` on a native WSL2 `ext4` checkout with CUDA PyTorch, `llama-cpp-python`, and deps |
+| `source scripts/activate_wsl.sh` | Activate the native WSL2 `ext4` environment and set `CUDA_HOME` and `HF_HOME` |
+| `python scripts/verify_gpu.py` | Verify CUDA availability in PyTorch and test-load the smallest `.gguf` in `MODELS/` via `llama_cpp` |
+
+## Legacy candidate-slate GGUF benchmark
+
+These exploratory scripts benchmark candidate GGUF models against the
+grandfathered 203-row `DATA/sms_extraction.yaml` task (`DATA/extraction_ds.jsonl`,
+`DATA/utils.py`, `DATA/llamacpp_model.py`). They are separate from the unified
+`evaluate-extractor` (`sms-extractor/1`) pipeline and must not be cited as
+unified-pipeline or production evidence.
 
 | Command | Purpose |
 |---|---|
-| `python scripts/review_lfm25_blinded_test.py export` | Freeze all test rows into a reviewer-blind, test-only local package |
-| `python scripts/review_lfm25_blinded_test.py export --source-prefill unambiguous` | Initialize the distinct candidate-assisted blinded package before its first workbench launch |
-| `python scripts/review_lfm25_blinded_test.py validate` | Validate complete or resumable partial human annotations without writing outputs |
-| `python scripts/run_lfm25_annotation_workbench.py blinded --reviewer <stable-id> --batch-size 50` | Review the frozen test package in a strictly local browser and durable blinded-test database |
-| `python scripts/run_lfm25_annotation_workbench.py training --reviewer <stable-id> --pool <private-jsonl> --batch-size 50` | Curate an explicit train/dev-only pool in an isolated local database |
-| `python scripts/run_lfm25_annotation_workbench_smoke.py` | Launch the real loopback UI with three invented rows and temporary state; no private loader or export is reachable |
-| `python scripts/run_lfm25_annotation_workbench.py export-training --reviewer <stable-id> --pool <private-jsonl>` | Export reviewed training curation plus an aggregate-only report without overwriting nonempty outputs |
-| `python scripts/review_lfm25_blinded_test.py import --workbench-db PRIVATE_DATA/lfm25/annotation_workbench/blinded_test.sqlite3` | Write completed test labels only after the durable workbench and required delayed-QC gate pass |
-| `python scripts/evaluate_lfm25_components.py --input DATA/annotation_component_v1_synthetic.jsonl --dry-run` | Validate the invented paired fixture and print aggregate component metrics only |
-| `python scripts/build_lfm25_private_sft_v2.py` | Rebuild the private source-grounded direct SFT set |
-| `python scripts/build_lfm25_candidate_sft.py` | Convert grounded direct rows to candidate-selector rows |
-| `python scripts/build_lfm25_candidate_curriculum.py` | Build low-weight semantic curriculum and mixed training data |
-| `python scripts/audit_lfm25_candidate_coverage.py` | Audit deterministic candidate coverage without training |
+| `bash scripts/fetch_models.sh` | Idempotently download candidate GGUFs into ignored `MODELS/` |
+| `bash scripts/evaluate.sh [--smoke-only\|--full-only\|--auto-full]` | Run the candidate GGUF benchmark slate via `run_gguf_eval.py` |
+| `python run_gguf_eval.py --model <hf_id> --gguf <path.gguf> [--grammar <path.gbnf>] [--thinking auto\|on\|off]` | Run `lm_eval` `sms_extraction` for one GGUF checkpoint |
 
-The workbench binds only to `127.0.0.1`; do not tunnel or share its URL. It writes
-state and rolling backups only below ignored `PRIVATE_DATA/lfm25`. Relaunch with
-the same mode, reviewer, database, batch size, and (for training) pool to resume.
+### Pipeline and run-isolation contract
 
-Open only the `http://127.0.0.1:<port>/` URL printed by the process. Opening
-`lfm25/annotation_assets/index.html` as a `file://` page bypasses the stylesheet,
-JavaScript, session, and row API, so it remains unstyled with no SMS and `0 / 0`.
-Use the synthetic smoke command above for UI/manual-browser verification; it
-stores its invented SQLite state under a temporary directory and removes it on
-shutdown.
+`scripts/evaluate.sh` invokes `run_gguf_eval.py` in a **fresh Python subprocess**
+per `(model, quantization, thinking_budget)` configuration. Isolating each run
+in its own subprocess prevents `llama.cpp` CUDA context/KV-cache state, global
+grammar objects, or tokenizer caches from leaking across candidate variants and
+ensures each output directory under `RESULTS/llamacpp/<model_slug>/` captures
+clean per-run metrics and sample artifacts.
 
-Source prefill is off unless explicitly selected. Assisted runs use
-`--source-prefill unambiguous`, are recorded as
-`human_verified_candidate_assisted`, and require a complete separate artifact
-lineage. First run assisted `export`, then repeat the flag on `validate`, every
-workbench launch/resume, and `import`. The assisted review JSONL, internal map,
-metadata, database, reviewed manifest, and import report never serve as the
-unaided projection or outputs. A reviewer must verify every suggested field and
-exact span; assisted and unaided results are methodologically distinct and must be
-reported separately. See the operating guide for exact commands and paths.
+## Local raw SMS archive utilities
 
-Training mode's generic `active_learning` filter deterministically prioritizes the
-ten documented category classes from the frozen pool/order, never from test. It
-hides the applicable category reasons until the first complete blind label; after
-completion the UI can show those local reasons, while proposal details still
-require an explicit **Reveal proposal** action.
-After all primary rows are complete and uncertainty is resolved, use **Start
-delayed QC pass** in the UI; a later relaunch of the same database resumes that QC
-session. Pending QC hides the previous annotation and event history; actionable
-initial/QC/adjudication history appears only after that blindness lifts. See the
-[local workbench operating guide](../docs/guides/LOCAL_ANNOTATION_WORKBENCH.md) for
-the ten category definitions, 50-row attention boundary, recovery command, and
-final gates.
+Two root utilities handle local-only iOS backup extraction outside the active
+SMS pipeline:
 
-For an unaided run, give reviewers only `blinded_test_review.jsonl`; for an
-assisted run, give them only `blinded_test_candidate_assisted_review.jsonl`. The
-matching ID map and provenance metadata remain internal, and files from the two
-policies must never be mixed. Import never edits the frozen
-`split_manifest.jsonl`: it writes the policy-selected reviewed manifest and
-aggregate report separately.
-It now requires the matching completed workbench database, no unresolved rows,
-and every required delayed-QC row to have passed. Existing nonempty outputs require
-an explicit `--force`. Package metadata and the import report are committed last
-as validity markers; a detected source change rolls the group back to its prior
-state.
-
-The final blinded reviewed manifest and reviewed training export preserve a
-`human_annotation_workbench` object with the generic annotation and event
-provenance. Private component-evaluation builders may pass its `annotation` field
-to `lfm25.component_evaluation.adapt_workbench_annotation(...)`; raw source rows,
-annotations, spans, event hashes, and per-row results must stay out of console
-output and Git.
-
-For each completed row, set `decision` to `transaction` or `not_transaction`,
-then fill `reviewer` and an ISO-8601 `reviewed_at` timestamp with a timezone.
-Transactions also require a numeric `amount`, `type` (`debit` or `credit`), and
-nonempty `account`; `counterparty` may be null. Non-transactions keep all four
-extraction fields null. Leave every annotation field null on untouched rows;
-`notes` is optional only after a decision is complete.
-
-Never put raw messages, spans, notes, row-level output, or screenshots in a
-terminal transcript, issue, pull request, or documentation. The workbench and
-component evaluator intentionally emit aggregate/status JSON only; keep their
-private inputs and outputs local.
-
-The filenames preserve compatibility with historical manifests. Dataset status and
-actual semantic versions are recorded in [the experiment catalog](../docs/experiments/EXPERIMENT_CATALOG.md).
-
-## Legacy private source archive acquisition
-
-Two root utilities preserve the old, local-only acquisition lineage from an
-iTunes backup to the source export accepted by private-data builders. They are
-not validated stages of the supported PocketFinancer pipeline:
-
-| Command | Purpose |
+| Script | Purpose |
 |---|---|
-| `python find_sms_db.py` | Legacy/unvalidated helper: from a controlled backup parent, choose the newest entry and copy its Messages database to `sms.db` |
-| `python export_sms.py [path/to/sms.db]` | Export recoverable iOS message text to `all_sms.json` and `all_sms.csv` |
+| `python find_sms_db.py` | Inspect the newest local backup subdirectory under `./` and copy its `sms.db` to `./sms.db` |
+| `python export_sms.py [path/to/sms.db]` | Export `text` and `attributedBody` messages from `sms.db` to ignored `all_sms.csv` and `all_sms.json` |
 
-`find_sms_db.py` does not validate directory candidates before choosing the newest
-entry. Do not run it from the repository root or an uninspected directory. The
-database and exports contain private data and must remain local and ignored.
-
-## Underlying training and evaluation commands
-
-| Command | Purpose |
-|---|---|
-| `python scripts/train_lfm25_lora.py --help` | Low-level LoRA trainer; PocketFinancer is the default profile |
-| `python scripts/evaluate_lfm25_candidate_hf.py --help` | Evaluate candidate selection and strict reconstruction |
-| `python scripts/evaluate_lfm25_android_hf.py --help` | HF prompt/training proxy; not a llama.cpp/Android runtime proof |
-| `python scripts/evaluate_lfm25_android_gguf.py --help` | Evaluate a deployable GGUF against the current runtime contract |
-| `python scripts/merge_lfm25_lora.py --help` | Merge a selected adapter into its HF base |
-| `bash scripts/convert_lfm25_gguf.sh --help` | Convert/quantize a merged model with the pinned toolchain |
-| `python scripts/compare_lfm25_predictions.py --help` | Compare paired per-row predictions |
-
-## Historical/general model slate
-
-`bash scripts/evaluate.sh` and root `run_gguf_eval.py` are the older broad GGUF
-benchmark. They remain useful for exploration but are not the default app-facing
-pipeline.
-
-The dated results and failure signatures from that work are preserved in the
-[general GGUF benchmark history](../docs/history/GENERAL_GGUF_BENCHMARK_2026-04-25.md).
-
-## Historical commands
-
-`scripts/run_lfm25_experiments.py`, `evaluate_lfm25_hf.py`,
-`evaluate_lfm25_gguf.py`, `build_lfm25_synthetic_sft.py`, and
-`build_lfm25_public_candidate.py` reproduce older short-prompt/synthetic work. Do
-not use them to claim current app parity. The runner intentionally rejects nonlegacy
-prompt profiles and fails closed on stale cached provenance.
+Do not run `find_sms_db.py` in an uninspected directory, and never commit or
+share `sms.db`, `all_sms.csv`, or `all_sms.json`.

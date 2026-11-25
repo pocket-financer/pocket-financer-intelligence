@@ -30,10 +30,33 @@ GRANDFATHERED_PATHS = frozenset({"DATA/extraction_ds.jsonl"})
 # exports. Keep this allowlist narrow: similarly named files must still fail.
 VERSIONED_PUBLIC_ARTIFACT_PATHS = frozenset(
     {
-        "DATA/candidate_protocol_v1_golden.json",
-        "DATA/annotation_component_v1_synthetic.jsonl",
-        "configs/contracts/pocketfinancer-candidate-v1.json",
-        "configs/pipelines/pocketfinancer-lfm2.5-350m-candidate-v1.json",
+        "configs/sms_processing/evaluations/model-quality.json",
+        "configs/sms_processing/profiles/account-resolution.json",
+        "configs/sms_processing/profiles/archive-india-inr.json",
+        "configs/sms_processing/profiles/core-en.json",
+        "configs/sms_processing/profiles/currency.json",
+        "configs/sms_processing/profiles/extractor-validation.json",
+        "configs/sms_processing/profiles/india.json",
+        "configs/sms_processing/profiles/persistence-policy.json",
+        "configs/sms_processing/profiles/reason-codes.json",
+        "configs/sms_processing/release-manifest.json",
+        "configs/sms_processing/schemas/apple-fm-flat.schema.json",
+        "configs/sms_processing/schemas/canonical-label.schema.json",
+        "configs/sms_processing/schemas/corpus-record.schema.json",
+        "configs/sms_processing/schemas/native-trace-bundle.schema.json",
+        "configs/sms_processing/schemas/processing-config.schema.json",
+        "configs/sms_processing/schemas/processing-result.schema.json",
+        "configs/sms_processing/schemas/processing-trace.schema.json",
+        "configs/sms_processing/schemas/release-manifest.schema.json",
+        "configs/sms_processing/schemas/review-case.schema.json",
+        "configs/sms_processing/schemas/sms-analysis.schema.json",
+        "configs/sms_processing/schemas/sms-extractor-input.schema.json",
+        "configs/sms_processing/schemas/sms-extractor.schema.json",
+        "configs/sms_processing/schemas/user-feedback.schema.json",
+        "tests/sms_processing/fixtures/extractor/synthetic-suite.jsonl",
+        "tests/sms_processing/golden/admission-v1.json",
+        "tests/sms_processing/golden/extractor-v1/sanitized-vectors.json",
+        "tests/sms_processing/golden/prefilter-vectors.json",
     }
 )
 
@@ -86,6 +109,8 @@ _RAW_EXPORT_NAME = re.compile(
     r"(?:^|[._-])(?:backup|candidate|dump|export(?:ed|s)?|messages?|raw|sms)(?:[._-]|$)"
 )
 _PATCH_BACKUP_ENDINGS = (".orig", ".rej", "~")
+_ARCHIVE_ENDINGS = (".tar", ".tar.gz", ".tgz", ".zip")
+_OPERATING_SYSTEM_METADATA = frozenset({".ds_store", "thumbs.db"})
 
 _MODEL_WEIGHT_ENDINGS = (
     ".bin",
@@ -171,6 +196,12 @@ def classify_path(path: str) -> str | None:
 
     if name.endswith(_PATCH_BACKUP_ENDINGS):
         return "patch backup"
+
+    if name in _OPERATING_SYSTEM_METADATA:
+        return "operating-system metadata"
+
+    if name.endswith(_ARCHIVE_ENDINGS):
+        return "archive"
 
     if name.endswith(_DATABASE_ENDINGS):
         return "database"
