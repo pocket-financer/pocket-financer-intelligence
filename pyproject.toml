@@ -11,10 +11,14 @@ extend-exclude = [
     ".venv",
     "lm-evaluation-harness",
     "MODELS",
+    "PRIVATE_DATA",
+    "PUBLIC_CANDIDATE",
     "RESULTS",
+    "TRAINING_ARTIFACTS",
+    "UPSTREAM",
 ]
 
 [tool.ruff.lint]
-# Enforce syntax and other fatal static errors across the legacy codebase.
-# CI applies the broader E/F rule set to its new scripts and tests separately.
+# Enforce syntax and fatal static errors across the full repository (including legacy root tools).
+# CI additionally enforces E4, E7, E9, F across src/, scripts/, and tests/.
 select = ["E9", "F63", "F7", "F82"]

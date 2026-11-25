@@ -5,16 +5,18 @@
 [![Pipeline Contract](https://img.shields.io/badge/contract-sms--pipeline%2F1-2E7D32)](configs/sms_processing/release-manifest.json)
 
 `pocket-financer-intelligence` is the canonical owner of PocketFinancer's
-platform-neutral SMS processing contracts, deterministic host pipeline, native
-asset synchronization, evaluation harness, and local encrypted annotation
-workbench.
+platform-neutral SMS processing contracts, deterministic Python reference
+pipeline, native asset synchronization, evaluation harness, and local encrypted
+annotation workbench. Native mobile implementations live in
+[pocket-financer-android](https://github.com/pocket-financer/pocket-financer-android)
+and [pocket-financer-ios](https://github.com/pocket-financer/pocket-financer-ios).
 
 On-device small language models (GGUF via `llama.cpp` on Android and Apple
 Foundation Models on iOS) perform classification and direct grounded field
 extraction. Deterministic host code owns same-source admission, fail-open
 prefiltering, advisory structural analysis, strict JSON and Unicode-scalar span
-validation, exact integer money normalization, account resolution, 5-minute
-duplicate detection, persistence gating, and body-free tombstones.
+validation, exact 64-bit integer money normalization, account resolution,
+5-minute duplicate detection, persistence gating, and body-free tombstones.
 
 ## System overview
 
@@ -36,27 +38,27 @@ flowchart LR
 All active contracts, JSON schemas, prompts, GBNF grammar, runtime policy, and
 SHA-256 bindings are published through
 [configs/sms_processing/release-manifest.json](configs/sms_processing/release-manifest.json)
-and synced cleanly into `pocket-financer-android` and `pocket-financer-ios` by
+and synchronized into Android and iOS by
 [scripts/sync_native_assets.py](scripts/sync_native_assets.py).
 
 ## Repository layout
 
 ```text
 configs/sms_processing/
-  release-manifest.json   Single SHA-256-bound release manifest for native apps
+  release-manifest.json   SHA-256-bound release manifest for native apps
   prompts/                SLM extractor prompts (GGUF & Apple FM guided flat)
-  grammars/               GBNF constraint grammar for direct JSON decoding
+  grammars/               GBNF grammar for direct JSON decoding
   profiles/               Currency, analyzer, validation, account, persistence & reason profiles
   schemas/                JSON Schemas for pipeline, extractor, trace, feedback, label, review
   evaluations/            Model-quality evaluation cohort & lane manifest
-src/pocketfinancer_sms/   Active Python reference pipeline, corpus builder, evals, workbench
+src/pocketfinancer_sms/   Python reference pipeline, corpus builder, evaluators, workbench
 scripts/                  CLI entry points, native asset sync, repo safety & WSL setup
-tests/                    Contract, prefilter, pipeline, evaluation, workbench & safety suites
+tests/                    Contract, prefilter, analyzer, pipeline, eval, workbench & guard suites
 DATA/                     Grandfathered 203-row regression fixture & legacy GGUF benchmark task
 docs/                     Architecture, evaluation, workbench & WSL setup guides
 ```
 
-Local and generated data directories are ignored by Git and enforced by
+Local and generated paths are ignored by Git and enforced by
 [scripts/check_repo_safety.py](scripts/check_repo_safety.py):
 
 | Ignored path | Contents |
@@ -73,66 +75,71 @@ Local and generated data directories are ignored by Git and enforced by
 
 ### 1. Lightweight verification (CI parity)
 
-From the WSL environment (`/home/tojinotzenin/pF_slm_selection/.venv/bin/python`
-or a `requirements-ci.txt` virtual environment):
+From a Python 3.11 environment with `requirements-ci.txt` (or the prepared WSL
+environment described in [docs/WSL_AND_LOCAL_SETUP.md](docs/WSL_AND_LOCAL_SETUP.md)):
 
 ```bash
 python scripts/check_repo_safety.py
 python scripts/sync_native_assets.py --check --manifest-only
 python -m ruff check .
 python -m ruff check --select E4,E7,E9,F src scripts tests
-python -m pytest -q
+shellcheck --external-sources --exclude=SC1090,SC1091,SC2086,SC2162,SC2317 -- $(git ls-files '*.sh')
+python -m pytest -v
 ```
 
-### 2. Sync native contract assets
+### 2. Synchronize native contract assets
 
 ```bash
 # Regenerate release-manifest.json hashes after editing configs/sms_processing/
 python scripts/sync_native_assets.py --manifest-only
 
-# Sync clean contracts, prompts, grammar, profiles, and prefilter vectors to sibling repos
+# Sync contracts, prompts, grammar, profiles, and prefilter vectors to sibling repos
 python scripts/sync_native_assets.py --target android
 python scripts/sync_native_assets.py --target ios
 python scripts/sync_native_assets.py --check
 ```
 
-### 3. Local corpus, workbench, and evaluation
+### 3. CLI command summary (`scripts/run_sms_processing.py`)
 
-```bash
-python scripts/run_sms_processing.py build-corpus
-python scripts/run_sms_processing.py init-workbench
-python scripts/run_sms_processing.py serve-workbench
-python scripts/run_sms_processing.py backup-workbench
-python scripts/run_sms_processing.py evaluate-extractor --gguf MODELS/<model>.gguf --suite synthetic --output-dir PRIVATE_DATA/sms_processing/evaluations/<run>
-python scripts/run_sms_processing.py evaluate-apple-fm --suite synthetic --output-dir PRIVATE_DATA/sms_processing/evaluations/<run>
-```
+Every subcommand prints aggregate-safe JSON only and keeps private state under
+ignored `PRIVATE_DATA/sms_processing/`.
+
+| Subcommand | Purpose | Guide |
+|---|---|---|
+| `prefilter [--text "<sms>"]` | Run `sms-prefilter/1` on a string or stdin | [Architecture](docs/ARCHITECTURE.md) |
+| `sync-native-assets [--manifest-only] [--check]` | Manifest build/verify wrapper | [Architecture](docs/ARCHITECTURE.md) |
+| `build-corpus [--config <path>]` | Build or reuse the canonical corpus run | [Workbench](docs/WORKBENCH.md) |
+| `migrate-secure-workbench` | Migrate plaintext `workbench.sqlite3` to SQLCipher `workbench-v2.sqlite3` | [Workbench](docs/WORKBENCH.md) |
+| `init-workbench` | Import `CURRENT.json` manifest into encrypted `workbench-v2.sqlite3` | [Workbench](docs/WORKBENCH.md) |
+| `serve-workbench [--port 8765]` | Serve the token-authenticated loopback UI (`127.0.0.1` only) | [Workbench](docs/WORKBENCH.md) |
+| `backup-workbench` | Create and verify an encrypted SQLCipher backup + manifest | [Workbench](docs/WORKBENCH.md) |
+| `export-workbench --selection-manifest <path> --consent-local-encrypted-export` | Export explicitly selected revisions as AES-256-GCM ciphertext | [Workbench](docs/WORKBENCH.md) |
+| `import-native-trace --bundle <path> [--key-id native-trace-import-v1]` | Import an encrypted Android/iOS trace bundle (rejects blind pools) | [Workbench](docs/WORKBENCH.md) |
+| `evaluate-extractor --gguf <path> --suite <suite> --output-dir <dir>` | Evaluate local GGUF via `llama-cpp-python` (`android_target_gguf`) | [Evaluation](docs/EVALUATION.md) |
+| `evaluate-apple-fm --output-dir <dir> [--suite <suite>]` | Evaluate Apple Foundation Models on macOS (`apple_fm_python`) | [Evaluation](docs/EVALUATION.md) |
 
 ## Future fine-tuning direction
 
-Legacy LFM2.5-specific training, LoRA probes, and candidate-selector sprawl have
-been removed. Future model-agnostic fine-tuning will be built cleanly on top of
-the SQLCipher workbench corpus using validated `CanonicalLabelV2` submissions
-projected directly to `pocketfinancer.sms-extractor/1` targets via
-`project_extractor_target(...)`, while preserving strict
-template-component-disjoint pool separation.
+Future model-agnostic fine-tuning will build directly on the SQLCipher workbench
+corpus using committed `CanonicalLabelV2` labels projected to
+`pocketfinancer.sms-extractor/1` targets via `project_extractor_target(...)`,
+preserving strict template-component-disjoint pool isolation.
 
 ## Privacy and evaluation rules
 
 - Real personal SMS, senders, account identifiers, private per-row outputs, and
   model weights must stay local and ignored—never commit, print, log, or upload
   them to external services or APIs.
-- All unit tests, docs, PR descriptions, and UI screenshots must use 100%
-  invented/synthetic messages and identifiers.
+- All unit tests, golden vectors, docs, PR descriptions, and UI screenshots must
+  use 100% invented synthetic data.
 - `DATA/extraction_ds.jsonl` is a grandfathered 203-row regression fixture only;
-  never train on it or cite it as fresh production evidence.
+  never train on it or cite it as a fresh test or production evidence.
 
 ## Documentation
 
-- [Documentation map](docs/README.md)
-- [Architecture](docs/ARCHITECTURE.md)
-- [Evaluation guide](docs/EVALUATION.md)
-- [Workbench guide](docs/WORKBENCH.md)
-- [WSL and local setup](docs/WSL_AND_LOCAL_SETUP.md)
-- [Agent and repository rules](AGENTS.md)
-- [Contributing guide](CONTRIBUTING.md)
-- [Scripts and CLI command map](scripts/README.md)
+- [Architecture](docs/ARCHITECTURE.md) — unified `sms-pipeline/1` stages, contracts, asset sync, status vocabulary, and planned fine-tuning
+- [Evaluation guide](docs/EVALUATION.md) — GGUF, Apple FM, and stateful evaluation lanes, cohorts, metrics, and legacy benchmark runner
+- [Workbench guide](docs/WORKBENCH.md) — canonical corpus builder, SQLCipher storage, loopback review UI, and encrypted exports
+- [WSL and local setup](docs/WSL_AND_LOCAL_SETUP.md) — WSL Ubuntu `.venv`, native WSL2 `ext4` CUDA setup, CI parity, macOS Apple FM, and local archive utilities
+- [Repository & agent instructions](AGENTS.md) — canonical rules for humans and coding agents
+- [Contributing guide](CONTRIBUTING.md) — branch, testing, contract-sync, and PR workflow

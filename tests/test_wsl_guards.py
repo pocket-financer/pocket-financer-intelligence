@@ -1,3 +1,7 @@
+"""WSL2 native-ext4 guards, bash syntax, and LF line-ending checks for tracked shell scripts."""
+
+from __future__ import annotations
+
 import os
 import pathlib
 import subprocess
@@ -10,17 +14,35 @@ ACTIVATE = ROOT / "scripts" / "activate_wsl.sh"
 SETUP = ROOT / "scripts" / "setup_wsl.sh"
 
 
+def _tracked_shell_scripts() -> list[pathlib.Path]:
+    completed = subprocess.run(
+        ["git", "ls-files", "-z", "--", "*.sh"],
+        cwd=ROOT,
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    return [
+        ROOT / item.decode("utf-8")
+        for item in completed.stdout.split(b"\0")
+        if item
+    ]
+
+
 def _is_native_wsl2() -> bool:
     release_file = pathlib.Path("/proc/sys/kernel/osrelease")
     if not release_file.is_file() or pathlib.Path("/.dockerenv").exists():
         return False
-    return "microsoft" in release_file.read_text(encoding="utf-8").lower() and "wsl2" in (
-        release_file.read_text(encoding="utf-8").lower()
-    )
+    release = release_file.read_text(encoding="utf-8").lower()
+    return "microsoft" in release and "wsl2" in release
 
 
-def test_wsl_entry_points_are_valid_bash() -> None:
-    for script in (ACTIVATE, SETUP):
+def test_all_tracked_shell_scripts_use_unix_lf_and_valid_bash_syntax() -> None:
+    scripts = _tracked_shell_scripts()
+    assert ACTIVATE in scripts
+    assert SETUP in scripts
+    for script in scripts:
+        raw = script.read_bytes()
+        assert b"\r\n" not in raw, f"CRLF line ending found in {script.relative_to(ROOT)}"
         subprocess.run(["bash", "-n", str(script)], check=True)
 
 
@@ -38,11 +60,11 @@ def test_entry_points_require_native_wsl2_ext4_and_reject_containers(
     assert "findmnt" in source
     assert 'repo_fstype" != "ext4"' in source or 'repo_fstype" == "ext4"' in source
 
-    guard_position = source.index("require_native_wsl2_ext4")
     if script == ACTIVATE:
         guard_position = source.index("pf_activate_require_native_wsl2_ext4")
         first_mutation = source.index('mkdir -p "$HF_HOME"')
     else:
+        guard_position = source.index("require_native_wsl2_ext4")
         first_mutation = source.index('"$UV_BIN" venv')
     assert guard_position < first_mutation
 

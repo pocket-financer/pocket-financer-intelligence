@@ -1,4 +1,4 @@
-"""Versioned state and revision-chain tests for direct extraction."""
+"""Tests for immutable config snapshots, canonical labels, review revisions, feedback, and traces."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from dataclasses import replace
 import pytest
 
 from pocketfinancer_sms.configuration import (
+    APPLE_PROMPT_VERSION,
     PIPELINE_CONTRACT,
     AssetBinding,
     ExtractorRuntimeConfig,
@@ -23,6 +24,7 @@ from pocketfinancer_sms.feedback import (
     UserFeedbackEventV3,
 )
 from pocketfinancer_sms.labels import (
+    CanonicalDecision,
     CanonicalLabelV2,
     EventState,
     ExtractorCanonicalEvent,
@@ -30,36 +32,58 @@ from pocketfinancer_sms.labels import (
     OperationalClass,
     ReviewStatus,
     project_extractor_target,
+    validate_canonical_label_v2,
 )
 from pocketfinancer_sms.processing import ReviewCase, ReviewUserRevision
 from pocketfinancer_sms.trace import ProcessingTraceV3, TraceEventV3
 from pocketfinancer_sms.types import Direction, TimestampProvenance
 
 
-def _source_and_event() -> tuple[str, ExtractorCanonicalEvent]:
-    source = "INR 42.50 was credited to account XX7788 from FRIEND."
+OP_ID = "11111111-1111-4111-8111-111111111111"
+OP_ID_2 = "22222222-2222-4222-8222-222222222222"
+
+
+def _source_and_label() -> tuple[str, CanonicalLabelV2]:
+    source = "INR 42.50 was credited to account **7788 from FRIEND."
 
     def span(text: str) -> SourceSpan:
         start = source.index(text)
         return SourceSpan.from_source(source, start, start + len(text))
 
-    return source, ExtractorCanonicalEvent(
+    event = ExtractorCanonicalEvent(
         amount_value="42.50",
         currency="INR",
         amount_span=span("INR 42.50"),
         direction=Direction.CREDIT,
         direction_span=span("credited"),
-        account_reference="XX7788",
-        account_span=span("XX7788"),
+        account_reference="**7788",
+        account_span=span("**7788"),
         existing_account_id="account-opaque-1",
         counterparty="FRIEND",
         counterparty_span=span("FRIEND"),
     )
+    label = CanonicalLabelV2(
+        label_id="synthetic-label-1",
+        source_id="synthetic-source",
+        revision=1,
+        status=ReviewStatus.SUBMITTED,
+        decision="posted",
+        operational_class=OperationalClass.POSTED_CANDIDATE,
+        event_state=EventState.POSTED,
+        financial_family="bank_transfer",
+        payment_rail="bank_internal",
+        event=event,
+        uncertain=False,
+        notes="synthetic",
+        reviewer_id="synthetic-reviewer",
+        created_at_epoch_ms=1_700_000_000_000,
+    )
+    return source, label
 
 
 def _config() -> ProcessingConfigSnapshot:
     return ProcessingConfigSnapshot(
-        operation_id="11111111-1111-4111-8111-111111111111",
+        operation_id=OP_ID,
         parent_operation_id=None,
         source_ref_hash="1" * 64,
         trigger=ProcessingTrigger.REALTIME,
@@ -98,12 +122,10 @@ def _config() -> ProcessingConfigSnapshot:
     )
 
 
-def _feedback_review(source: str) -> ReviewCase:
+def _review_case(source: str) -> ReviewCase:
     return ReviewCase(
         review_case_id="review-synthetic",
-        operation_id_hash=hashlib.sha256(
-            "11111111-1111-4111-8111-111111111111".encode()
-        ).hexdigest(),
+        operation_id_hash=hashlib.sha256(OP_ID.encode()).hexdigest(),
         raw_sender="SYNTH-BANK",
         source=source,
         received_at_epoch_ms=1_700_000_000_000,
@@ -116,7 +138,7 @@ def _feedback_review(source: str) -> ReviewCase:
     )
 
 
-def test_processing_config_is_immutable_hashed_and_timestamp_read_only() -> None:
+def test_processing_config_hashing_immutability_and_runtime_guards() -> None:
     config = _config()
     payload = config.to_dict()
     assert payload["contract"] == PIPELINE_CONTRACT
@@ -129,55 +151,98 @@ def test_processing_config_is_immutable_hashed_and_timestamp_read_only() -> None
     }
     assert payload["config_hash"] == config.config_hash
     assert replace(config, primary_currency="USD").config_hash != config.config_hash
+
+    # System-managed Apple FM runtime requires no GGUF hash and allows apple_fm_guided_flat.
+    apple_runtime = ExtractorRuntimeConfig(
+        eligible=True,
+        ineligibility_reason=None,
+        model_identifier="SystemLanguageModel.general",
+        model_file_sha256=None,
+        model_identity_kind="system_managed_runtime",
+        runtime_version="synthetic-ios",
+        os_version="synthetic-os",
+        device_cohort="synthetic-device",
+        prompt_sha256="6" * 64,
+        validation_profile_sha256="8" * 64,
+        wire_transport=WireTransport.APPLE_FM_GUIDED_FLAT,
+        prompt_version=APPLE_PROMPT_VERSION,
+    )
+    assert replace(config, extractor=apple_runtime).config_hash != config.config_hash
+
     with pytest.raises(ValueError, match="release provenance"):
         replace(config, release_id="native-integration-v2")
     with pytest.raises(ValueError, match="analyzer provenance"):
         replace(config, analyzer_behavior_version="pocketfinancer.structural-sms-analyzer/1")
+    with pytest.raises(ValueError, match="parent operation"):
+        replace(config, trigger=ProcessingTrigger.RETRY, parent_operation_id=None)
+    with pytest.raises(ValueError, match="own parent"):
+        replace(config, trigger=ProcessingTrigger.RETRY, parent_operation_id=OP_ID)
+    with pytest.raises(ValueError, match="GGUF hash"):
+        replace(apple_runtime, model_file_sha256="a" * 64)
 
 
-def test_canonical_label_v2_projects_direct_json_without_analyzer_candidates() -> None:
-    source, event = _source_and_event()
-    label = CanonicalLabelV2(
-        label_id="synthetic-label",
-        source_id="synthetic-source",
-        revision=1,
-        status=ReviewStatus.SUBMITTED,
-        decision="posted",
-        operational_class=OperationalClass.POSTED_CANDIDATE,
-        event_state=EventState.POSTED,
-        financial_family="bank_transfer",
-        payment_rail="bank_internal",
-        event=event,
-        uncertain=False,
-        notes="synthetic",
-        reviewer_id="synthetic-reviewer",
-        created_at_epoch_ms=1_700_000_000_000,
-    )
+def test_canonical_label_v2_validation_and_direct_extractor_projection() -> None:
+    source, label = _source_and_label()
+    validate_canonical_label_v2(label, source)
     target = project_extractor_target(label, source)
     assert target["decision"] == "posted"
     assert target["amount"]["value"] == "42.50"
-    assert target["account"]["evidence"]["text"] == "XX7788"
+    assert target["amount"]["currency"] == "INR"
+    assert target["direction"]["value"] == "credit"
+    assert target["account"]["reference"] == "**7788"
+    assert target["account"]["evidence"]["text"] == "**7788"
+    assert target["counterparty"]["value"] == "FRIEND"
     assert "candidate" not in repr(target)
 
-    invalid = replace(label, event=replace(event, account_span=event.direction_span))
-    with pytest.raises(LabelValidationError, match="label_extractor_event_invalid"):
-        project_extractor_target(invalid, source)
+    # Draft, uncertain, and invalid_outgoing labels cannot project as training targets.
+    with pytest.raises(LabelValidationError, match="projection_label_not_committed"):
+        project_extractor_target(replace(label, status=ReviewStatus.DRAFT), source)
+    with pytest.raises(LabelValidationError, match="projection_uncertain"):
+        project_extractor_target(replace(label, uncertain=True), source)
 
-
-def test_review_case_records_read_only_receipt_and_revision_hashes() -> None:
-    review = ReviewCase(
-        review_case_id="review-synthetic",
-        operation_id_hash="a" * 64,
-        raw_sender="SYNTH-BANK",
-        source="Synthetic body",
-        received_at_epoch_ms=1_700_000_000_000,
-        primary_reason="extractor_abstained",
-        reason_codes=("extractor_abstained",),
-        furthest_stage="extractor_validation",
-        analyzer_suggestions=(),
-        extractor_suggestion=None,
-        account_resolution=None,
+    invalid_outgoing = replace(
+        label,
+        decision="none",
+        operational_class=OperationalClass.INVALID_OUTGOING,
+        event_state=EventState.NO_EVENT,
+        financial_family=None,
+        payment_rail=None,
+        event=None,
     )
+    validate_canonical_label_v2(invalid_outgoing, source)
+    with pytest.raises(LabelValidationError, match="projection_invalid_outgoing_excluded"):
+        project_extractor_target(invalid_outgoing, source)
+
+    # Non-posted committed labels project cleanly without an event payload.
+    non_financial = replace(
+        invalid_outgoing, operational_class=OperationalClass.NON_FINANCIAL
+    )
+    assert project_extractor_target(non_financial, source) == {"decision": "none"}
+
+    # Misgrounded amount or account spans fail validation.
+    assert label.event is not None
+    with pytest.raises(LabelValidationError, match="label_extractor_event_invalid"):
+        validate_canonical_label_v2(
+            replace(label, event=replace(label.event, amount_span=label.event.direction_span)),
+            source,
+        )
+    with pytest.raises(LabelValidationError, match="label_extractor_event_invalid"):
+        project_extractor_target(
+            replace(label, event=replace(label.event, account_span=label.event.direction_span)),
+            source,
+        )
+
+    assert {item.value for item in CanonicalDecision} == {
+        "posted",
+        "not_posted",
+        "non_financial",
+        "ambiguous",
+        "multiple_event",
+    }
+
+
+def test_review_case_revision_chain_and_read_only_receipt() -> None:
+    review = _review_case("Synthetic body")
     payload = review.to_dict()
     assert payload["receipt_timestamp"]["read_only"] is True
     assert payload["source_sha256"]
@@ -226,8 +291,10 @@ def test_review_case_records_read_only_receipt_and_revision_hashes() -> None:
         )
 
 
-def test_feedback_v3_uses_spans_and_direction_control_without_timestamp_actions() -> None:
-    source, event = _source_and_event()
+def test_feedback_v3_validates_source_spans_operation_and_forbids_time_edits() -> None:
+    source, label = _source_and_label()
+    assert label.event is not None
+    event = label.event
     amount = FieldRevisionV3(
         "amount",
         "42.50",
@@ -246,19 +313,23 @@ def test_feedback_v3_uses_spans_and_direction_control_without_timestamp_actions(
         event.account_span,
         "account-opaque-1",
     )
+    common = {
+        "action_id": OP_ID_2,
+        "operation_id": OP_ID,
+        "review_case": _review_case(source),
+        "expected_review_revision": 0,
+        "resulting_review_revision": 1,
+        "action": "correct",
+        "actor_id": "synthetic-user",
+        "created_at_epoch_ms": 1_700_000_000_100,
+    }
     feedback = UserFeedbackEventV3.create(
-        action_id="22222222-2222-4222-8222-222222222222",
-        operation_id="11111111-1111-4111-8111-111111111111",
-        review_case=_feedback_review(source),
-        expected_review_revision=0,
-        resulting_review_revision=1,
-        action="correct",
-        actor_id="synthetic-user",
         field_revisions=(amount, direction, account),
-        created_at_epoch_ms=1_700_000_000_100,
+        **common,
     )
     assert feedback.to_dict()["field_revisions"][1]["span"] is None
     assert len(feedback.event_hash) == 64
+
     with pytest.raises(ValueError, match="unsupported"):
         FieldRevisionV3(
             "transaction_time",
@@ -267,28 +338,12 @@ def test_feedback_v3_uses_spans_and_direction_control_without_timestamp_actions(
             SourceSpan.from_source(source, 0, 3),
         )
 
-
-def test_feedback_v3_rejects_source_spans_not_bound_to_the_review_sms() -> None:
-    source, event = _source_and_event()
-    common = {
-        "action_id": "22222222-2222-4222-8222-222222222222",
-        "operation_id": "11111111-1111-4111-8111-111111111111",
-        "review_case": _feedback_review(source),
-        "expected_review_revision": 0,
-        "resulting_review_revision": 1,
-        "action": "correct",
-        "actor_id": "synthetic-user",
-        "created_at_epoch_ms": 1_700_000_000_100,
-    }
     substituted_source = "USD 99.99 was credited to account XX7788."
-    substituted_span = SourceSpan.from_source(
-        substituted_source, 0, len("USD 99.99")
-    )
     fabricated = FieldRevisionV3(
         "amount",
         "99.99",
         FieldRevisionProvenance.SOURCE_SPAN_SELECTION,
-        substituted_span,
+        SourceSpan.from_source(substituted_source, 0, len("USD 99.99")),
     )
     with pytest.raises(ValueError, match="does not match source"):
         UserFeedbackEventV3.create(field_revisions=(fabricated,), **common)
@@ -302,27 +357,21 @@ def test_feedback_v3_rejects_source_spans_not_bound_to_the_review_sms() -> None:
     with pytest.raises(ValueError, match="span is invalid"):
         UserFeedbackEventV3.create(field_revisions=(out_of_bounds,), **common)
 
-    valid = FieldRevisionV3(
-        "amount",
-        "42.50",
-        FieldRevisionProvenance.SOURCE_SPAN_SELECTION,
-        event.amount_span,
-    )
-    wrong_operation = {
-        **common,
-        "operation_id": "33333333-3333-4333-8333-333333333333",
-    }
     with pytest.raises(ValueError, match="operation does not match"):
-        UserFeedbackEventV3.create(field_revisions=(valid,), **wrong_operation)
+        UserFeedbackEventV3.create(
+            field_revisions=(amount,),
+            **{**common, "operation_id": "33333333-3333-4333-8333-333333333333"},
+        )
 
 
-def test_processing_trace_v3_hash_chain_and_extractor_stages() -> None:
+def test_processing_trace_v3_hash_chain_and_stage_validation() -> None:
     first = TraceEventV3(
         sequence=0,
         event_id="33333333-3333-4333-8333-333333333333",
         occurred_at_epoch_ms=1_700_000_000_000,
-        stage="analysis_advisory",
+        stage="prefilter",
         status="completed",
+        reason_codes=("prefilter_eligible",),
     )
     second = TraceEventV3(
         sequence=1,
@@ -333,17 +382,40 @@ def test_processing_trace_v3_hash_chain_and_extractor_stages() -> None:
         previous_event_hash=first.event_hash,
     )
     trace = ProcessingTraceV3.create(
-        operation_id="11111111-1111-4111-8111-111111111111",
+        operation_id=OP_ID,
         config_hash="a" * 64,
         owner_generation=1,
         events=(first, second),
     )
+    shorter = ProcessingTraceV3.create(
+        operation_id=OP_ID,
+        config_hash="a" * 64,
+        owner_generation=1,
+        events=(first,),
+    )
     assert trace.contract == "pocketfinancer.processing-trace/3"
     assert len(trace.trace_hash) == 64
+    assert trace.trace_hash != shorter.trace_hash
+
     with pytest.raises(ValueError, match="hash chain"):
         ProcessingTraceV3.create(
-            operation_id="11111111-1111-4111-8111-111111111111",
+            operation_id=OP_ID,
             config_hash="a" * 64,
             owner_generation=1,
             events=(first, replace(second, previous_event_hash="b" * 64)),
+        )
+    with pytest.raises(ValueError, match="contiguous"):
+        ProcessingTraceV3.create(
+            operation_id=OP_ID,
+            config_hash="a" * 64,
+            owner_generation=1,
+            events=(second,),
+        )
+    with pytest.raises(ValueError, match="stage or status"):
+        TraceEventV3(
+            sequence=0,
+            event_id="55555555-5555-4555-8555-555555555555",
+            occurred_at_epoch_ms=1_700_000_000_000,
+            stage="nonexistent_stage",
+            status="completed",
         )
