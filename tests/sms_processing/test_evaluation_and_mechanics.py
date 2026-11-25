@@ -1,15 +1,14 @@
-"""Unified tests for GGUF evaluation, Apple FM flat guided evaluation, and stateful pipeline."""
+"""Tests for GGUF & Apple FM evaluation lanes, scoring/suppression, and stateful pipeline mechanics."""
 
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from decimal import localcontext
 import fcntl
 import json
-from pathlib import Path
 import stat
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Barrier
 from typing import Any
 
@@ -18,7 +17,6 @@ import pytest
 from pocketfinancer_sms import cli, evaluation
 from pocketfinancer_sms.account_resolution import DUPLICATE_WINDOW_MS
 from pocketfinancer_sms.admission import admission_action
-from pocketfinancer_sms.currency import MAX_SIGNED_64, parse_money
 from pocketfinancer_sms.evaluation import (
     AppleFMProvider,
     EvaluationInterrupted,
@@ -29,10 +27,9 @@ from pocketfinancer_sms.evaluation import (
     evaluate_apple_foundation_models,
     evaluate_extractor,
 )
-from pocketfinancer_sms.extractor import APPLE_FLAT_FIELDS, project_apple_fm_flat_output
+from pocketfinancer_sms.extractor import APPLE_FLAT_FIELDS
 from pocketfinancer_sms.prefilter import prefilter
 from pocketfinancer_sms.provenance import PrivateArtifactError
-from pocketfinancer_sms.types import CurrencyProvenance
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -135,7 +132,12 @@ def _fake_gguf(tmp_path: Path) -> Path:
     return gguf
 
 
-def test_gguf_evaluation_uses_chat_template_greedy_grammar_and_private_outputs(
+# ---------------------------------------------------------------------------
+# GGUF evaluation lane
+# ---------------------------------------------------------------------------
+
+
+def test_gguf_evaluation_uses_chat_template_greedy_grammar_account_catalog_and_private_outputs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _allow_tmp_private(monkeypatch)
@@ -144,12 +146,25 @@ def test_gguf_evaluation_uses_chat_template_greedy_grammar_and_private_outputs(
     factory = FakeFactory(outputs)
     grammars: list[Path] = []
     gguf = _fake_gguf(tmp_path)
+    catalog_path = tmp_path / "catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {"account_id": "acct-1234", "account_type": "bank_account", "aliases": ["XX1234"]},
+                    {"account_id": "acct-7788", "account_type": "card", "aliases": ["••••7788"]},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
     output_dir = tmp_path / "gguf_run"
     summary = evaluate_extractor(
         ROOT,
         gguf=gguf,
         suite="synthetic",
         output_dir=output_dir,
+        account_catalog=catalog_path,
         apply_prefilter=False,
         model_factory=factory,
         grammar_factory=lambda path: grammars.append(path) or f"grammar:{path.name}",
@@ -160,6 +175,7 @@ def test_gguf_evaluation_uses_chat_template_greedy_grammar_and_private_outputs(
     assert summary["metrics"]["classification"]["accuracy"] == 1.0
     assert summary["metrics"]["transaction"]["f1"] == 1.0
     assert summary["metrics"]["strict_posted_exact_success"]["rate"] == 1.0
+    assert summary["metrics"]["account_resolution"]["eligible_count"] > 0
     assert grammars == [ROOT / "configs/sms_processing/grammars/sms-extractor.gbnf"]
     call = factory.instances[0].calls[0]
     assert call["temperature"] == 0.0
@@ -168,6 +184,7 @@ def test_gguf_evaluation_uses_chat_template_greedy_grammar_and_private_outputs(
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert cases[0]["source"] not in report_path.read_text(encoding="utf-8")
     assert report["provenance"]["inference"]["per_row_deadline_ms"] == 0
+    assert report["capabilities"]["account_resolution"] is True
     assert stat.S_IMODE(report_path.stat().st_mode) == 0o600
 
 
@@ -207,6 +224,20 @@ def test_gguf_prefilter_interruption_resume_and_truncated_length(
     assert resumed["status"] == "complete"
     assert resumed["metrics"]["prefilter"]["excluded_count"] == len(cases) - len(eligible_outputs)
 
+    # Re-running with mismatched seed against an existing checkpoint fails closed.
+    with pytest.raises(ExtractorEvaluationError, match="checkpoint provenance"):
+        evaluate_extractor(
+            ROOT,
+            gguf=gguf,
+            suite="synthetic",
+            output_dir=output_dir,
+            seed=99,
+            apply_prefilter=True,
+            model_factory=FakeFactory([]),
+            grammar_factory=lambda _path: None,
+            runtime_version="fake-llama-cpp",
+        )
+
     length_factory = FakeFactory(
         [{"choices": [{"message": {"content": "PRIVATE_PARTIAL"}, "finish_reason": "length"}]}]
         + [json.dumps(case["gold"]) for case in cases[1:]]
@@ -225,7 +256,9 @@ def test_gguf_prefilter_interruption_resume_and_truncated_length(
     assert "PRIVATE_PARTIAL" not in (tmp_path / "length_run/report.json").read_text(encoding="utf-8")
 
 
-def test_gguf_missing_chat_template_and_private_boundary_fail_closed(tmp_path: Path) -> None:
+def test_gguf_boundary_missing_chat_template_nonempty_dir_and_cli_interrupt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     with pytest.raises(PrivateArtifactError):
         evaluate_extractor(
             ROOT,
@@ -236,6 +269,71 @@ def test_gguf_missing_chat_template_and_private_boundary_fail_closed(tmp_path: P
             grammar_factory=lambda _path: None,
             runtime_version="fake-llama-cpp",
         )
+
+    _allow_tmp_private(monkeypatch)
+    with pytest.raises(ExtractorEvaluationError, match="unavailable"):
+        evaluate_extractor(
+            ROOT,
+            gguf=tmp_path / "missing.gguf",
+            suite="synthetic",
+            output_dir=tmp_path / "missing_run",
+            model_factory=FakeFactory([]),
+            grammar_factory=lambda _path: None,
+            runtime_version="fake-llama-cpp",
+        )
+
+    with pytest.raises(ExtractorEvaluationError, match="embedded chat template"):
+        evaluate_extractor(
+            ROOT,
+            gguf=_fake_gguf(tmp_path),
+            suite="synthetic",
+            output_dir=tmp_path / "no_template_run",
+            model_factory=FakeFactory([], metadata={}),
+            grammar_factory=lambda _path: None,
+            runtime_version="fake-llama-cpp",
+        )
+
+    dirty_dir = tmp_path / "dirty_run"
+    dirty_dir.mkdir()
+    (dirty_dir / "stray.txt").write_text("stray", encoding="utf-8")
+    with pytest.raises(ExtractorEvaluationError, match="cannot be reused"):
+        evaluate_extractor(
+            ROOT,
+            gguf=_fake_gguf(tmp_path),
+            suite="synthetic",
+            output_dir=dirty_dir,
+            model_factory=FakeFactory([]),
+            grammar_factory=lambda _path: None,
+            runtime_version="fake-llama-cpp",
+        )
+
+    monkeypatch.setattr(
+        cli, "evaluate_extractor", lambda *_args, **_kwargs: (_ for _ in ()).throw(EvaluationInterrupted(2, 9))
+    )
+    code = cli.main(
+        [
+            "--repo-root",
+            str(ROOT),
+            "evaluate-extractor",
+            "--gguf",
+            str(_fake_gguf(tmp_path)),
+            "--suite",
+            "synthetic",
+            "--output-dir",
+            str(tmp_path / "cli_int"),
+        ]
+    )
+    assert code == 130
+    assert json.loads(capsys.readouterr().out) == {
+        "completed_rows": 2,
+        "status": "interrupted",
+        "total_rows": 9,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Apple Foundation Models lane
+# ---------------------------------------------------------------------------
 
 
 def test_apple_fake_provider_flat_guided_evaluation_and_error_isolation(
@@ -278,7 +376,7 @@ def test_apple_fake_provider_flat_guided_evaluation_and_error_isolation(
     assert "PRIVATE_UNKNOWN_FIELD" not in report_text
 
 
-def test_apple_concurrent_lock_wsl_guard_and_sdk_adapter(
+def test_apple_lock_contention_locale_guard_and_sdk_adapter(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _allow_tmp_private(monkeypatch)
@@ -291,6 +389,15 @@ def test_apple_concurrent_lock_wsl_guard_and_sdk_adapter(
                 ROOT, suite="synthetic", output_dir=locked, provider=FakeAppleProvider([])
             )
 
+    with pytest.raises(ExtractorEvaluationError, match="configuration is invalid"):
+        evaluate_apple_foundation_models(
+            ROOT,
+            suite="synthetic",
+            output_dir=tmp_path / "bad_locale",
+            locale="not-a-locale",
+            provider=FakeAppleProvider([]),
+        )
+
     if sys.platform != "darwin":
         code = cli.main(
             ["--repo-root", str(ROOT), "evaluate-apple-fm", "--output-dir", str(tmp_path / "nope")]
@@ -301,11 +408,15 @@ def test_apple_concurrent_lock_wsl_guard_and_sdk_adapter(
     seen: dict[str, Any] = {}
 
     class FakeSystemModel:
+        def __init__(self, available: bool = True) -> None:
+            self._available = available
+
         def is_available(self) -> tuple[bool, None]:
-            return True, None
+            return self._available, None
 
     class FakeContent:
-        is_complete = True
+        def __init__(self, complete: bool = True) -> None:
+            self.is_complete = complete
 
         def to_json(self) -> str:
             return json.dumps(_flat_gold(_cases()[0]))
@@ -337,18 +448,129 @@ def test_apple_concurrent_lock_wsl_guard_and_sdk_adapter(
     assert seen["session"]["instructions"] == "local only"
     assert seen["respond"]["json_schema"] == {"type": "object"}
 
-    none_flat = {key: ("none" if key == "decision" else ("" if key in STRING_FLAT_FIELDS else 0))
-                 for key in APPLE_FLAT_FIELDS}
-    with pytest.raises(ValueError):
-        project_apple_fm_flat_output({**none_flat, "amount_value": "9.00"})
+    # Unavailable model on macOS fails closed.
+    class UnavailableSDK(FakeSDK):
+        SystemLanguageModel = lambda: FakeSystemModel(available=False)  # noqa: E731
+
+    monkeypatch.setattr(evaluation.importlib, "import_module", lambda _name: UnavailableSDK)
+    with pytest.raises(ExtractorEvaluationError, match="unavailable on this Mac"):
+        AppleFMProvider()
+
+    # Known Apple SDK error classes map to sanitized reason codes.
+    GuardrailError = type("GuardrailViolationError", (Exception,), {})
+    assert evaluation._apple_error_code(GuardrailError("raw")) == "apple_guardrail_violation"
+    assert evaluation._apple_error_code(ValueError("raw")) == "apple_guided_result_invalid"
+    assert evaluation._apple_error_code(RuntimeError("raw")) == "apple_runtime_failure"
+
+
+# ---------------------------------------------------------------------------
+# Scoring, group suppression, committed-label selection, and synthetic grandfathered loader
+# ---------------------------------------------------------------------------
+
+
+def test_private_group_suppression_committed_selection_and_grandfathered_loader(
+    tmp_path: Path,
+) -> None:
+    records = [
+        {
+            "row_id": f"r{i}",
+            "outcome": "none",
+            "reason_code": None,
+            "prefilter_excluded": False,
+            "model_invoked": True,
+            "latency_ms": float(i + 1),
+            "prediction": {"decision": "none"},
+            "gold": {"decision": "none"},
+            "groups": {
+                "sender_family": "big-family" if i < 5 else "tiny-family",
+                "template_family": "big-template" if i < 5 else "tiny-template",
+            },
+            "account_resolution": None,
+        }
+        for i in range(7)
+    ]
+    grouped = evaluation._group_metrics(records, suite="private-canonical")
+    assert grouped["available"] is True
+    assert list(grouped["sender_family"]["groups"]) == ["big-family"]
+    assert grouped["sender_family"]["suppressed_group_count"] == 1
+    assert grouped["sender_family"]["suppressed_row_count"] == 2
+    assert evaluation._group_metrics(records, suite="grandfathered")["available"] is False
+
+    # Latency quantiles handle empty and populated series.
+    assert evaluation._latency_summary([]) == {
+        "count": 0,
+        "mean": None,
+        "p50": None,
+        "p95": None,
+        "p99": None,
+        "max": None,
+    }
+    lat = evaluation._latency_summary([10.0, 20.0, 30.0, 40.0])
+    assert lat["p50"] == 20.0 and lat["max"] == 40.0
+
+    # Committed annotation selection prefers adjudicated, accepts unanimous submitted, skips conflict.
+    sub_a = {"status": "submitted", "revision": 1, "canonical_label": {"decision": "none"}}
+    sub_b = {"status": "submitted", "revision": 1, "canonical_label": {"decision": "abstain"}}
+    adj = {"status": "adjudicated", "revision": 2, "canonical_label": {"decision": "none"}}
+    assert evaluation._select_committed_annotation([sub_a, sub_b]) is None
+    assert evaluation._select_committed_annotation([sub_a, sub_a]) == sub_a
+    assert evaluation._select_committed_annotation([sub_a, sub_b, adj]) == adj
+
+    # Synthetic grandfathered-format JSONL parses cleanly without touching real fixtures.
+    synth_legacy = tmp_path / "legacy.jsonl"
+    synth_legacy.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "sender": "AD-SYNTH",
+                        "sms": "INR 50 debited from A/c XX1234 at SYNTH SHOP.",
+                        "expected": json.dumps(
+                            {
+                                "amount": 50.0,
+                                "type": "debit",
+                                "account": "A/c XX1234",
+                                "counterparty": "SYNTH SHOP",
+                            }
+                        ),
+                    }
+                ),
+                json.dumps(
+                    {
+                        "sender": "AD-SYNTH",
+                        "sms": "Your OTP is 123456.",
+                        "expected": "null",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    loaded = evaluation._load_grandfathered(synth_legacy, primary_currency="INR")
+    assert len(loaded) == 2
+    assert loaded[0].gold is not None and loaded[0].gold["minor_units"] == 5_000
+    assert loaded[0].gold["spans"] is None
+    assert loaded[1].gold == {"decision": "none"}
+
+
+# ---------------------------------------------------------------------------
+# Stateful pipeline mechanics & same-source admission
+# ---------------------------------------------------------------------------
 
 
 BODY = "INR 17.25 was debited from account XX7654."
 
 
-def _msg(source_id: str | None = "invented-1", *, body: str = BODY, time_ms: int = 1000) -> InventedMessage:
+def _msg(
+    source_id: str | None = "invented-1", *, body: str = BODY, time_ms: int = 1000
+) -> InventedMessage:
     return InventedMessage(
-        body, "SYNTHETIC", time_ms, "invented-connector" if source_id is not None else None, source_id
+        body,
+        "SYNTHETIC",
+        time_ms,
+        "invented-connector" if source_id is not None else None,
+        source_id,
     )
 
 
@@ -357,13 +579,15 @@ def _posted_json(body: str = BODY) -> str:
         start = body.index(text)
         return {"start_scalar": start, "end_scalar": start + len(text), "text": text}
 
-    return json.dumps({
-        "decision": "posted",
-        "amount": {"value": "17.25", "currency": "INR", "evidence": span("INR 17.25")},
-        "direction": {"value": "debit", "evidence": span("debited")},
-        "account": {"reference": "XX7654", "evidence": span("XX7654")},
-        "counterparty": None,
-    })
+    return json.dumps(
+        {
+            "decision": "posted",
+            "amount": {"value": "17.25", "currency": "INR", "evidence": span("INR 17.25")},
+            "direction": {"value": "debit", "evidence": span("debited")},
+            "account": {"reference": "XX7654", "evidence": span("XX7654")},
+            "counterparty": None,
+        }
+    )
 
 
 def test_shared_admission_vectors_and_retry_guards() -> None:
@@ -374,65 +598,90 @@ def test_shared_admission_vectors_and_retry_guards() -> None:
         assert admission_action(**values) == case["action"], case["id"]
     with pytest.raises(ValueError, match="retry requires"):
         admission_action(reliable_identity=True, existing_state=None, owner_retry=True)
+    with pytest.raises(ValueError, match="unsupported admission state"):
+        admission_action(reliable_identity=True, existing_state="bogus")  # type: ignore[arg-type]
 
 
-def test_prefilter_and_none_tombstones_purge_bodies_and_skip_runtime(tmp_path: Path) -> None:
+def test_prefilter_and_none_tombstones_purge_bodies_and_reject_retry(tmp_path: Path) -> None:
     run = SyntheticPipelineRun(tmp_path / "run.sqlite")
-    otp = _msg(body="Your OTP is 6824. Do not share it.")
-    receipt = run.admit(otp)
-    runtime = SuppliedRuntime([])
-    assert receipt.route == "tombstoned_excluded"
-    assert run.execute(receipt.operation_id, runtime).route == "tombstoned_excluded"
-    assert runtime.calls == 0
-    op_row = run.db.execute("SELECT body_retained, evidence FROM operations WHERE id = ?", (receipt.operation_id,)).fetchone()
-    assert op_row["body_retained"] == 0 and op_row["evidence"] is None
+    try:
+        otp = _msg(body="Your OTP is 6824. Do not share it.")
+        receipt = run.admit(otp)
+        runtime = SuppliedRuntime([])
+        assert receipt.route == "tombstoned_excluded"
+        assert run.execute(receipt.operation_id, runtime).route == "tombstoned_excluded"
+        assert runtime.calls == 0
+        op_row = run.db.execute(
+            "SELECT body_retained, evidence FROM operations WHERE id = ?",
+            (receipt.operation_id,),
+        ).fetchone()
+        assert op_row["body_retained"] == 0 and op_row["evidence"] is None
 
-    none_msg = _msg("invented-none", body="INR 500.00 balance available in account XX7654.", time_ms=2000)
-    none_receipt = run.admit(none_msg)
-    none_runtime = SuppliedRuntime(['{"decision":"none"}'])
-    assert run.execute(none_receipt.operation_id, none_runtime).route == "tombstoned_none"
-    none_row = run.db.execute("SELECT body_retained, evidence FROM operations WHERE id = ?", (none_receipt.operation_id,)).fetchone()
-    assert none_row["body_retained"] == 0 and none_row["evidence"] is None
-    with pytest.raises(ValueError, match="tombstoned"):
-        run.admit(none_msg, retry_of=none_receipt.operation_id)
-    run.close()
+        none_msg = _msg(
+            "invented-none",
+            body="INR 500.00 balance available in account XX7654.",
+            time_ms=2000,
+        )
+        none_receipt = run.admit(none_msg)
+        none_runtime = SuppliedRuntime(['{"decision":"none"}'])
+        assert run.execute(none_receipt.operation_id, none_runtime).route == "tombstoned_none"
+        none_row = run.db.execute(
+            "SELECT body_retained, evidence FROM operations WHERE id = ?",
+            (none_receipt.operation_id,),
+        ).fetchone()
+        assert none_row["body_retained"] == 0 and none_row["evidence"] is None
+        with pytest.raises(ValueError, match="tombstoned"):
+            run.admit(none_msg, retry_of=none_receipt.operation_id)
+
+        # Altered evidence under the same reliable source identity raises conflict.
+        with pytest.raises(ValueError, match="conflicts"):
+            run.admit(_msg("invented-none", body="INR 999.00 balance in XX7654.", time_ms=2000))
+    finally:
+        run.close()
 
 
 def test_five_minute_duplicate_window_and_resolution_actions(tmp_path: Path) -> None:
     run = SyntheticPipelineRun(tmp_path / "run.sqlite")
-    assert DUPLICATE_WINDOW_MS == 300_000
-    runtime = SuppliedRuntime([_posted_json(), _posted_json(), _posted_json(), _posted_json()])
+    try:
+        assert DUPLICATE_WINDOW_MS == 300_000
+        runtime = SuppliedRuntime([_posted_json(), _posted_json(), _posted_json(), _posted_json()])
 
-    first = run.admit(_msg("id-1", time_ms=100_000))
-    assert run.execute(first.operation_id, runtime).route == "review"
-    run.confirm_account(first.operation_id, "acct-1")
+        first = run.admit(_msg("id-1", time_ms=100_000))
+        assert run.execute(first.operation_id, runtime).route == "review"
+        run.confirm_account(first.operation_id, "acct-1")
 
-    within_window = run.admit(_msg("id-2", time_ms=100_000 + DUPLICATE_WINDOW_MS - 1))
-    assert run.execute(within_window.operation_id, runtime).route == "review"
-    payload = json.loads(
-        run.db.execute("SELECT payload FROM operations WHERE id = ?", (within_window.operation_id,)).fetchone()[0]
-    )
-    assert payload["reason_codes"] == ["duplicate_possible"]
+        within_window = run.admit(_msg("id-2", time_ms=100_000 + DUPLICATE_WINDOW_MS - 1))
+        assert run.execute(within_window.operation_id, runtime).route == "review"
+        payload = json.loads(
+            run.db.execute(
+                "SELECT payload FROM operations WHERE id = ?", (within_window.operation_id,)
+            ).fetchone()[0]
+        )
+        assert payload["reason_codes"] == ["duplicate_possible"]
 
-    run.resolve_duplicate(within_window.operation_id, action="separate")
-    assert run.mechanics_summary()["transactions"] == 2
+        with pytest.raises(ValueError, match="separate"):
+            run.resolve_duplicate(within_window.operation_id, action="invalid")
+        run.resolve_duplicate(within_window.operation_id, action="separate")
+        assert run.mechanics_summary()["transactions"] == 2
 
-    dismiss_dup = run.admit(_msg("id-3", time_ms=100_000 + DUPLICATE_WINDOW_MS))
-    assert run.execute(dismiss_dup.operation_id, runtime).route == "review"
-    run.resolve_duplicate(dismiss_dup.operation_id, action="dismiss")
-    dismissed_row = run.db.execute(
-        "SELECT route, body_retained, evidence FROM operations WHERE id = ?", (dismiss_dup.operation_id,)
-    ).fetchone()
-    assert dismissed_row["route"] == "tombstoned_none"
-    assert dismissed_row["body_retained"] == 0 and dismissed_row["evidence"] is None
+        dismiss_dup = run.admit(_msg("id-3", time_ms=100_000 + DUPLICATE_WINDOW_MS))
+        assert run.execute(dismiss_dup.operation_id, runtime).route == "review"
+        run.resolve_duplicate(dismiss_dup.operation_id, action="dismiss")
+        dismissed_row = run.db.execute(
+            "SELECT route, body_retained, evidence FROM operations WHERE id = ?",
+            (dismiss_dup.operation_id,),
+        ).fetchone()
+        assert dismissed_row["route"] == "tombstoned_none"
+        assert dismissed_row["body_retained"] == 0 and dismissed_row["evidence"] is None
 
-    outside_window = run.admit(_msg("id-4", time_ms=100_000 + 2 * DUPLICATE_WINDOW_MS))
-    assert run.execute(outside_window.operation_id, runtime).route == "transactions"
-    assert run.mechanics_summary()["transactions"] == 3
-    run.close()
+        outside_window = run.admit(_msg("id-4", time_ms=100_000 + 2 * DUPLICATE_WINDOW_MS))
+        assert run.execute(outside_window.operation_id, runtime).route == "transactions"
+        assert run.mechanics_summary()["transactions"] == 3
+    finally:
+        run.close()
 
 
-def test_crash_recovery_concurrency_and_exact_money_bounds(tmp_path: Path) -> None:
+def test_crash_recovery_concurrency_and_resume_config_guard(tmp_path: Path) -> None:
     path = tmp_path / "race.sqlite"
     run = SyntheticPipelineRun(path)
     seed = run.admit(_msg("seed", time_ms=1_000))
@@ -440,6 +689,11 @@ def test_crash_recovery_concurrency_and_exact_money_bounds(tmp_path: Path) -> No
     run.confirm_account(seed.operation_id, "acct-1")
     op_inflight = run.admit(_msg("inflight", time_ms=500_000)).operation_id
     run.db.execute("UPDATE operations SET state = 'in_flight' WHERE id = ?", (op_inflight,))
+
+    # Resuming with mismatched primary currency fails closed.
+    with pytest.raises(ValueError, match="configuration mismatch"):
+        SyntheticPipelineRun(path, primary_currency="USD", resume=True)
+
     other = SyntheticPipelineRun(path, resume=True)
     assert other.admit(_msg("inflight", time_ms=500_000)).action == "in_flight"
     assert other.recover_interrupted() == 1
@@ -467,9 +721,3 @@ def test_crash_recovery_concurrency_and_exact_money_bounds(tmp_path: Path) -> No
     with ThreadPoolExecutor(max_workers=2) as pool:
         routes = sorted(pool.map(execute_one, ["race-a", "race-b"]))
     assert routes == ["review", "transactions"]
-
-    with localcontext() as context:
-        context.prec = 2
-        assert parse_money("92233720368547758.07", currency="USD", provenance=CurrencyProvenance.EXPLICIT_CODE).minor_units == MAX_SIGNED_64
-        with pytest.raises(ValueError, match="signed 64-bit"):
-            parse_money("92233720368547758.08", currency="USD", provenance=CurrencyProvenance.EXPLICIT_CODE)

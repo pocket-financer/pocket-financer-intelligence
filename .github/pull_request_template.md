@@ -4,41 +4,43 @@
 
 ## Scope and end-to-end behavior
 
-<!-- Identify affected contract, data, training, evaluation, conversion, or runtime
+<!-- Identify affected contract, data, evaluation, workbench, CI, or runtime
 paths. State what is deliberately unchanged. -->
 
-## Experiment and app alignment
+## Cross-repo and contract alignment
 
-<!-- Note the Android revision/profile, dataset roles, model/quantization, metric
-interpretation, and runtime-parity boundary when relevant. Write "Not applicable"
-for a change that cannot affect them. -->
+<!-- Note any impact on `release-manifest.json`, `pocket-financer-android`,
+`pocket-financer-ios`, `prefilter-vectors.json`, dataset roles, or runtime
+parity. Write "Not applicable" when unchanged. -->
 
 ## Verification
 
-<!-- List exact commands and results. Distinguish lightweight, CUDA, GGUF, and
-target-device checks. -->
+<!-- List exact commands and observed results. Distinguish lightweight CI/WSL,
+CUDA/GGUF, macOS Apple FM, and physical Android/iOS device checks. -->
 
-- [ ] Repository safety check passes
-- [ ] Relevant automated tests pass
-- [ ] Ruff/static checks pass
-- [ ] Pipeline/profile check passes, or is not applicable
-- [ ] Runtime/device verification is complete, or its gap is documented
+- [ ] `python scripts/check_repo_safety.py` passes
+- [ ] `python scripts/sync_native_assets.py --check --manifest-only` passes
+- [ ] `python -m ruff check .` and `python -m ruff check --select E4,E7,E9,F src scripts tests` pass
+- [ ] ShellCheck passes on tracked `*.sh` files
+- [ ] `python -m pytest -v` passes
+- [ ] `git diff --check` is clean and all edited files use Unix `LF` endings
+- [ ] Runtime/device verification is complete, or its gap is documented honestly
 
 ## Privacy, reproducibility, and compatibility
 
-<!-- Cover private data, leakage, seeds/hashes/provenance, output compatibility,
-memory/latency, cache/artifact reuse, and rollback implications. -->
+<!-- Cover private data boundaries, synthetic-only fixtures, seeds/hashes/provenance,
+schema/output compatibility, and rollback implications. -->
 
 ## Evidence
 
-<!-- Aggregate metrics, non-sensitive logs, screenshots, or links to reports. Never
-paste raw SMS, identifiers, private per-row output, credentials, or weights. -->
+<!-- Aggregate metrics, non-sensitive logs, or links to reports. Never paste raw
+SMS, identifiers, private per-row output, credentials, or model weights. -->
 
 ## Checklist
 
-- [ ] I read `AGENTS.md` and verified relevant prose against executable code
-- [ ] This change is focused and does not include generated/private artifacts
-- [ ] The PR title uses a Conventional Commit type
-- [ ] The 203-row regression fixture is not presented as a fresh test
-- [ ] HF, host GGUF, and Android-device evidence are labeled truthfully
+- [ ] I read `AGENTS.md` and verified all prose against executable code and schemas
+- [ ] This change is focused and includes zero generated or private artifacts
+- [ ] The PR title uses a Conventional Commit prefix
+- [ ] The grandfathered 203-row fixture (`DATA/extraction_ds.jsonl`) is not presented as a fresh test
+- [ ] Host GGUF, Apple FM, Android-device, and iOS-device evidence are labeled truthfully
 - [ ] No model, dataset, or application publication is implied by this PR

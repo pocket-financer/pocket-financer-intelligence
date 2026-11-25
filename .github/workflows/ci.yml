@@ -2,6 +2,8 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
 
@@ -42,6 +44,37 @@ jobs:
       - name: Verify native SMS contract manifest
         run: python scripts/sync_native_assets.py --check --manifest-only
 
+      - name: Verify Unix LF line endings and git whitespace hygiene
+        run: |
+          python - <<'PY'
+          import pathlib
+          import subprocess
+          import sys
+
+          text_suffixes = {
+              ".sh", ".py", ".json", ".jsonl", ".txt", ".gbnf",
+              ".md", ".yml", ".yaml", ".toml", ".html", ".css", ".js",
+          }
+          tracked = [
+              item.decode("utf-8")
+              for item in subprocess.check_output(["git", "ls-files", "-z"]).split(b"\0")
+              if item
+          ]
+          crlf_files = [
+              path
+              for path in tracked
+              if pathlib.Path(path).suffix.lower() in text_suffixes
+              and b"\r\n" in pathlib.Path(path).read_bytes()
+          ]
+          if crlf_files:
+              print("CRLF line endings found in tracked files:", file=sys.stderr)
+              for path in crlf_files:
+                  print(f"  - {path}", file=sys.stderr)
+              sys.exit(1)
+          print(f"Verified LF line endings across {len(tracked)} tracked files.")
+          PY
+          git diff --check
+
       - name: Install lightweight CI tools
         run: python -m pip install --requirement requirements-ci.txt
 
@@ -66,4 +99,4 @@ jobs:
           fi
 
       - name: Run unit tests
-        run: python -m pytest
+        run: python -m pytest -v

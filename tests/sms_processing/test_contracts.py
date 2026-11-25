@@ -1,4 +1,4 @@
-"""Schema, manifest, and synthetic vector checks for unified SMS contracts."""
+"""Schema, profile, release-manifest, and sanitized golden contract verification."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from pocketfinancer_sms.configuration import (
     RolloutMode,
     WireTransport,
 )
-from pocketfinancer_sms.currency import CurrencyContext
+from pocketfinancer_sms.currency import ISO_4217_CURRENT_CODES, ISO_MINOR_UNITS, CurrencyContext
 from pocketfinancer_sms.extractor import (
     APPLE_FLAT_FIELDS,
     ExtractionValidationError,
@@ -43,6 +43,7 @@ from pocketfinancer_sms.processing import (
 from pocketfinancer_sms.provenance import file_sha256
 from pocketfinancer_sms.trace import ProcessingTraceV3, TraceEventV3
 from pocketfinancer_sms.types import TimestampProvenance
+from scripts import sync_native_assets
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -76,7 +77,29 @@ def test_every_active_schema_is_valid_draft_2020_12() -> None:
         jsonschema.Draft202012Validator.check_schema(_schema(name))
 
 
-def test_profiles_and_reason_codes_are_complete_and_unique() -> None:
+def test_release_manifest_validates_against_schema_assets_and_hashes() -> None:
+    manifest = _json(SMS_CONFIGS / "release-manifest.json")
+    jsonschema.validate(manifest, _schema("release-manifest.schema.json"))
+    assert manifest["release_id"] == PIPELINE_CONTRACT
+    assert manifest["duplicate_window_ms"] == 300_000
+
+    paths = {item["path"] for item in manifest["artifacts"]}
+    assert {
+        "prompts/sms-extractor.txt",
+        "prompts/apple-fm-sms-extractor.txt",
+        "grammars/sms-extractor.gbnf",
+        "schemas/apple-fm-flat.schema.json",
+        "profiles/persistence-policy.json",
+    } <= paths
+    for artifact in manifest["artifacts"]:
+        target = SMS_CONFIGS / artifact["path"]
+        assert target.is_file(), artifact["path"]
+        assert target.read_bytes().strip(), artifact["path"]
+        assert file_sha256(target) == artifact["sha256"]
+    assert sync_native_assets.sync(ROOT, check=True, manifest_only=True) == 0
+
+
+def test_profiles_currency_asset_and_reason_codes_match_python_runtime() -> None:
     validation_profile = _json(PROFILES / "extractor-validation.json")
     assert validation_profile["contract"] == "pocketfinancer.extractor-validation-profile/1"
     account_profile = _json(PROFILES / "account-resolution.json")
@@ -85,6 +108,12 @@ def test_profiles_and_reason_codes_are_complete_and_unique() -> None:
     assert persistence_policy["contract"] == "pocketfinancer.persistence-policy/1"
     assert persistence_policy["duplicate_window_ms"] == 300_000
     assert persistence_policy["retain_rejected_body"] is False
+
+    currency_profile = _json(PROFILES / "currency.json")
+    assert {
+        code: entry["minor_units"] for code, entry in currency_profile["currencies"].items()
+    } == ISO_MINOR_UNITS
+    assert set(currency_profile["current_codes"]) == ISO_4217_CURRENT_CODES
 
     registry = _json(PROFILES / "reason-codes.json")
     codes = [item["code"] for namespace in registry["namespaces"] for item in namespace["codes"]]
@@ -122,7 +151,9 @@ def test_profiles_and_reason_codes_are_complete_and_unique() -> None:
 
 
 def test_sanitized_goldens_are_grounded_and_parse_under_schema() -> None:
-    golden = _json(ROOT / "tests" / "sms_processing" / "golden" / "extractor-v1" / "sanitized-vectors.json")
+    golden = _json(
+        ROOT / "tests" / "sms_processing" / "golden" / "extractor-v1" / "sanitized-vectors.json"
+    )
     schema = _schema("sms-extractor.schema.json")
     for case in golden["cases"]:
         jsonschema.validate(case["model_output"], schema)
@@ -148,15 +179,17 @@ def test_sanitized_goldens_are_grounded_and_parse_under_schema() -> None:
             assert result.transaction.account_reference == case["expected"]["account_reference"]
 
 
-def test_executable_input_config_result_review_feedback_and_trace_match_schemas() -> None:
+def test_executable_payloads_match_published_json_schemas() -> None:
     source = "INR 42.50 was credited to account XX7788."
     analysis = _analyzer().analyze(
         source,
         operation_id=OPERATION_ID,
         operation_config_hash=SHA,
         source_timestamp_epoch_ms=RECEIVED_AT,
-        source_timestamp_provenance=TimestampProvenance.PLATFORM_RECEIVED,
+        source_timestamp_provenance=TimestampProvenance.ACQUISITION_SUPPLIED_MESSAGE_TIME,
     )
+    jsonschema.validate(analysis.to_dict(), _schema("sms-analysis.schema.json"))
+
     request = build_extractor_input(
         source,
         analysis,
@@ -290,7 +323,20 @@ def test_executable_input_config_result_review_feedback_and_trace_match_schemas(
     assert posted_payload["automatic_persistence"]["result"] == "eligible"
     jsonschema.validate(posted_payload, _schema("processing-result.schema.json"))
 
-    review = ReviewCase(
+    base_review = ReviewCase(
+        review_case_id="synthetic-feedback-review",
+        operation_id_hash=hashlib.sha256(OPERATION_ID.encode()).hexdigest(),
+        raw_sender="AD-SYNTH",
+        source=source,
+        received_at_epoch_ms=RECEIVED_AT,
+        primary_reason="extractor_abstained",
+        reason_codes=("extractor_abstained",),
+        furthest_stage="extractor_validation",
+        analyzer_suggestions=(),
+        extractor_suggestion=None,
+        account_resolution=None,
+    )
+    revised_review = ReviewCase(
         review_case_id="synthetic-review",
         operation_id_hash=hashlib.sha256(OPERATION_ID.encode()).hexdigest(),
         raw_sender="AD-SYNTH",
@@ -320,24 +366,14 @@ def test_executable_input_config_result_review_feedback_and_trace_match_schemas(
         revision=2,
         previous_revision_hash="e" * 64,
     )
-    jsonschema.validate(json.loads(json.dumps(review.to_dict())), _schema("review-case.schema.json"))
+    jsonschema.validate(
+        json.loads(json.dumps(revised_review.to_dict())), _schema("review-case.schema.json")
+    )
 
     feedback = UserFeedbackEventV3.create(
         action_id="22222222-2222-4222-8222-222222222222",
         operation_id=OPERATION_ID,
-        review_case=ReviewCase(
-            review_case_id="synthetic-feedback-review",
-            operation_id_hash=hashlib.sha256(OPERATION_ID.encode()).hexdigest(),
-            raw_sender="AD-SYNTH",
-            source=source,
-            received_at_epoch_ms=RECEIVED_AT,
-            primary_reason="extractor_abstained",
-            reason_codes=("extractor_abstained",),
-            furthest_stage="extractor_validation",
-            analyzer_suggestions=(),
-            extractor_suggestion=None,
-            account_resolution=None,
-        ),
+        review_case=base_review,
         expected_review_revision=0,
         resulting_review_revision=1,
         action="correct",
@@ -363,7 +399,9 @@ def test_executable_input_config_result_review_feedback_and_trace_match_schemas(
             ),
         ),
     )
-    jsonschema.validate(json.loads(json.dumps(asdict(trace))), _schema("processing-trace.schema.json"))
+    jsonschema.validate(
+        json.loads(json.dumps(asdict(trace))), _schema("processing-trace.schema.json")
+    )
 
 
 def test_apple_flat_schema_matches_python_projection_fields() -> None:
@@ -371,13 +409,15 @@ def test_apple_flat_schema_matches_python_projection_fields() -> None:
     assert tuple(flat_schema["required"]) == APPLE_FLAT_FIELDS
     assert tuple(flat_schema["properties"]) == APPLE_FLAT_FIELDS
     projected = project_apple_fm_flat_output(
-        {key: ("none" if key == "decision" else ("" if not key.endswith(("_start", "_end")) else 0))
-         for key in APPLE_FLAT_FIELDS}
+        {
+            key: ("none" if key == "decision" else ("" if not key.endswith(("_start", "_end")) else 0))
+            for key in APPLE_FLAT_FIELDS
+        }
     )
     jsonschema.validate(projected, _schema("sms-extractor.schema.json"))
 
 
-def test_canonical_label_v2_retains_taxonomy_and_requires_grounded_posted_fields() -> None:
+def test_canonical_label_v2_schema_requires_grounded_posted_fields() -> None:
     source = "INR 42.50 was credited to account XX7788."
 
     def span(text: str) -> dict:
@@ -415,25 +455,18 @@ def test_canonical_label_v2_retains_taxonomy_and_requires_grounded_posted_fields
     }
     schema = _schema("canonical-label.schema.json")
     jsonschema.validate(payload, schema)
+
     payload["event"]["counterparty"] = "SYNTHETIC MERCHANT"
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(payload, schema)
+
     payload["event"]["counterparty"] = None
     del payload["event"]["direction_span"]
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(payload, schema)
 
 
-def test_release_manifest_validates_against_schema_and_file_hashes() -> None:
-    manifest = _json(SMS_CONFIGS / "release-manifest.json")
-    jsonschema.validate(manifest, _schema("release-manifest.schema.json"))
-    assert manifest["release_id"] == PIPELINE_CONTRACT
-    assert manifest["duplicate_window_ms"] == 300_000
-    for artifact in manifest["artifacts"]:
-        assert file_sha256(SMS_CONFIGS / artifact["path"]) == artifact["sha256"]
-
-
-def test_output_contract_rejects_time_fields_and_utf_offsets() -> None:
+def test_output_contract_rejects_time_fields_and_utf16_offsets() -> None:
     schema = _schema("sms-extractor.schema.json")
     payload = {
         "decision": "posted",
